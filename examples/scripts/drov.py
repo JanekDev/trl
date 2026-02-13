@@ -159,7 +159,22 @@ def _expand_ultrafeedback_batch(
     for instruction, models, completion_list in zip(
         batch["instruction"], batch["models"], batch["completions"], strict=True
     ):
-        for model_name, completion in zip(models, completion_list, strict=True):
+        if models is None:
+            models = []
+        if completion_list is None:
+            completion_list = []
+
+        # Some UltraFeedback revisions contain occasional rows where the number of
+        # `models` entries differs from the number of `completions`. We iterate over
+        # completions and resolve model names per item (fallback to index-aligned `models`).
+        for completion_index, completion in enumerate(completion_list):
+            if not isinstance(completion, dict):
+                continue
+
+            model_name = completion.get("model")
+            if model_name is None and completion_index < len(models):
+                model_name = models[completion_index]
+
             if source_model is not None and model_name != source_model:
                 continue
             response = completion.get("response")
