@@ -736,7 +736,8 @@ class DROVTrainer(BaseTrainer):
 
     def save_model(self, output_dir: str | None = None, _internal_call: bool = False):
         backup_model = self.model
-        self.model = self.model.policy
+        policy_model = self.model.policy if hasattr(self.model, "policy") else self.model
+        self.model = policy_model
 
         if self.is_deepspeed_enabled:
             backup_deepspeed = self.deepspeed
@@ -755,7 +756,8 @@ class DROVTrainer(BaseTrainer):
     def _save_checkpoint(self, model, trial) -> None:
         del model
         backup_model = self.model
-        self.model = self.model.policy
+        policy_model = self.model.policy if hasattr(self.model, "policy") else self.model
+        self.model = policy_model
         try:
             super()._save_checkpoint(self.model, trial)
         finally:
