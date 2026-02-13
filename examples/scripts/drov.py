@@ -109,6 +109,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=2000)
     parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=None,
+        help="Evaluation frequency in optimizer steps. Defaults to --save_steps when unset.",
+    )
+    parser.add_argument(
         "--overfit_one_batch",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -425,7 +431,7 @@ def main() -> None:
         training_kwargs["eval_strategy"] = "no"
     else:
         training_kwargs["eval_strategy"] = "steps"
-        training_kwargs["eval_steps"] = args.save_steps
+        training_kwargs["eval_steps"] = args.eval_steps if args.eval_steps is not None else args.save_steps
     training_args = DROVConfig(**training_kwargs)
 
     eval_dataset = None if args.overfit_one_batch else dataset["test"]
