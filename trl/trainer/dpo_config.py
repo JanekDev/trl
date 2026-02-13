@@ -17,13 +17,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-import transformers
-from packaging.version import Version
 from transformers import TrainingArguments
 
 
 class FDivergenceType(Enum):
-    """Types of f-divergence functions for DPO loss regularization.
+    """
+    Types of f-divergence functions for DPO loss regularization.
+
+    <Deprecated version="0.28.0">
+
+    Using `FDivergenceType` for `f_divergence_type` in [`DPOConfig`] is deprecated and will be removed in version
+    0.29.0. Use a string instead.
+
+    </Deprecated>
 
     Attributes:
         REVERSE_KL: Reverse KL divergence.
@@ -123,8 +129,8 @@ class DPOConfig(TrainingArguments):
                 - `"sppo_hard"`: SPPO loss with hard label from the [SPPO](https://huggingface.co/papers/2405.00675)
                   paper.
                 - `"aot"`: AOT loss for paired datasets from the [AOT](https://huggingface.co/papers/2406.05882) paper.
-                - `"aot_pair"`: AOT loss for unpaired datasets from the [AOT](https://huggingface.co/papers/2406.05882)
-                  paper.
+                - `"aot_unpaired"`: AOT loss for unpaired datasets from the
+                  [AOT](https://huggingface.co/papers/2406.05882) paper.
                 - `"discopop"`: DiscoPOP (a.k.a Log-Ratio Modulated Loss, LRML) loss from the
                   [DiscoPOP](https://huggingface.co/papers/2406.08414) paper.
                 - `"apo_zero"`: APO-zero loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
@@ -138,8 +144,12 @@ class DPOConfig(TrainingArguments):
             Parameter controlling the deviation from the reference model. Higher β means less deviation from the
             reference model. For the IPO loss (`loss_type="ipo"`), β is the regularization parameter denoted by τ in
             the [paper](https://huggingface.co/papers/2310.12036).
-        f_divergence_type ([`FDivergenceType`] or `str`, *optional*, defaults to `FDivergenceType.REVERSE_KL`):
+        f_divergence_type (`str`, *optional*, defaults to `"reverse_kl"`):
             Type of f-divergence regularization function to compute divergence between policy and reference model.
+            Supported values:
+                - `"reverse_kl"`: Reverse KL divergence.
+                - `"js_divergence"`: Jensen-Shannon divergence.
+                - `"alpha_divergence"`: Alpha divergence.
         f_alpha_divergence_coef (`float`, *optional*, defaults to `1.0`):
             α coefficient in the α-divergence u^-α regularization function for DPO loss.
         label_smoothing (`float`, *optional*, defaults to `0.0`):
@@ -274,7 +284,7 @@ class DPOConfig(TrainingArguments):
             <Deprecated version="0.28.0">
 
             This parameter is deprecated and will be removed in version 0.29.0. If you want a reference-free objective,
-            use [`CPOTrainer`] instead.
+            use [`experimental.cpo.CPOTrainer`] instead.
 
             </Deprecated>
         rpo_alpha (`float`, *optional*):
@@ -421,7 +431,7 @@ class DPOConfig(TrainingArguments):
         default_factory=lambda: ["sigmoid"],
         metadata={
             "help": "Type of loss to use. Possible values are: `'sigmoid'`, `'hinge'`, `'ipo'`, `'exo_pair'`, "
-            "`'nca_pair'`, `'robust'`, `'bco_pair'`, `'sppo_hard'`, `'aot'`, `'aot_pair'`, `'discopop'`, "
+            "`'nca_pair'`, `'robust'`, `'bco_pair'`, `'sppo_hard'`, `'aot'`, `'aot_unpaired'`, `'discopop'`, "
             "`'apo_zero'`, `'apo_down'` and `'sft'`. Multiple loss types can be combined using comma separation "
             "(e.g., `['sigmoid', 'bco_pair', 'sft']` for MPO). The `loss_weights` parameter can be used to specify "
             "corresponding weights for each loss type."
@@ -434,11 +444,12 @@ class DPOConfig(TrainingArguments):
             "Higher β means less deviation from the reference model."
         },
     )
-    f_divergence_type: FDivergenceType | str = field(
-        default=FDivergenceType.REVERSE_KL,
+    f_divergence_type: str = field(
+        default="reverse_kl",
         metadata={
             "help": "Type of f-divergence regularization function to compute divergence between policy and reference "
-            "model."
+            "model.",
+            "choices": ["reverse_kl", "js_divergence", "alpha_divergence"],
         },
     )
     f_alpha_divergence_coef: float = field(
@@ -604,21 +615,13 @@ class DPOConfig(TrainingArguments):
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
-        # Transformers explicitly set use_reentrant=True in the past to silence a PyTorch warning, but the default was
-        # never updated once PyTorch switched to recommending use_reentrant=False. Until that change lands upstream
-        # (see https://github.com/huggingface/transformers/pull/43203) and is released (most likely in 5.0.0), we
-        # default to the recommended non-reentrant behavior here, while preserving any user-provided value.
-        if self.gradient_checkpointing and Version(transformers.__version__) < Version("5.0.0"):
-            self.gradient_checkpointing_kwargs = self.gradient_checkpointing_kwargs or {}
-            self.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
-
         if self.base_model_attribute_name is not None:
             warnings.warn(
                 "`base_model_attribute_name` is deprecated and will be removed in version 0.29.0. The base model "
                 "will be retrieved via `get_decoder`; if your model does not support this, it will no longer be "
                 "supported by the DPO trainer.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         else:  # keep the old default
             self.base_model_attribute_name = "model"
@@ -628,7 +631,7 @@ class DPOConfig(TrainingArguments):
                 "`force_use_ref_model` is deprecated and will be removed in version 0.29.0. There is no need to pass "
                 "this argument anymore: if you provide a reference model, it will be used automatically.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
 
         if self.generate_during_eval is not None:
@@ -636,7 +639,7 @@ class DPOConfig(TrainingArguments):
                 "`generate_during_eval` is deprecated and will be removed in version 0.29.0. Please use a callback "
                 "instead. See the example at `https://gist.github.com/qgallouedec/a08da3457a3a76c5ca539d4a0b38e482`.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         else:  # keep the old default
             self.generate_during_eval = False
@@ -646,25 +649,27 @@ class DPOConfig(TrainingArguments):
                 "`label_pad_token_id` is deprecated and will be removed in version 0.29.0. It will no longer be "
                 "possible to set this value.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         else:  # keep the old default
             self.label_pad_token_id = -100
 
-        if self.max_completion_length is not None:
+        if self.max_completion_length != -1:
             warnings.warn(
                 "`max_completion_length` is deprecated and will be removed in version 0.29.0. We recommend using "
                 "`max_length` instead to control the maximum length of samples.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
+        else:  # keep the old default
+            self.max_completion_length = None
 
         if self.max_prompt_length != -1:
             warnings.warn(
-                "`max_prompt_length` is deprecated and will be removed in version 0.29.0. We recommend filtering out"
+                "`max_prompt_length` is deprecated and will be removed in version 0.29.0. We recommend filtering out "
                 "overlong prompts from your dataset before passing it to the trainer instead of using this parameter.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         else:  # keep the old default
             self.max_prompt_length = 512
@@ -674,7 +679,7 @@ class DPOConfig(TrainingArguments):
                 "`model_adapter_name` is deprecated and will be removed in version 0.29.0. Only the default adapter "
                 "will be supported going forward.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
 
         if self.ref_adapter_name is not None:
@@ -683,7 +688,7 @@ class DPOConfig(TrainingArguments):
                 "training an adapter, you won't need this argument anymore in the next version and can rely on the "
                 "trainer. For now, it is still the only supported way to do this.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
 
         if self.ref_model_init_kwargs is not None:
@@ -692,7 +697,7 @@ class DPOConfig(TrainingArguments):
                 "init kwargs for the reference model, instantiate it yourself and pass it via the `ref_model` "
                 "argument.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
 
         if self.reference_free is not None:
@@ -700,7 +705,7 @@ class DPOConfig(TrainingArguments):
                 "`reference_free` is deprecated and will be removed in version 0.29.0. If you want a reference-free "
                 "objective, use `CPOTrainer` instead.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         else:  # keep the old default
             self.reference_free = False
@@ -711,7 +716,7 @@ class DPOConfig(TrainingArguments):
                 "`'sft'` in `loss_type`; we recommend adding `'sft'` to `loss_type` and setting its weight in "
                 "`loss_weights` to `rpo_alpha`.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
 
         if self.tools is not None:
@@ -720,7 +725,7 @@ class DPOConfig(TrainingArguments):
                 "tools should be provided via the dataset instead but for now, `DPOConfig.tools` remains the only "
                 "supported way to pass tools.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
 
         if self.use_logits_to_keep is not None:
@@ -728,12 +733,19 @@ class DPOConfig(TrainingArguments):
                 "`use_logits_to_keep` is deprecated and will be removed in version 0.29.0. The DPO trainer will no "
                 "longer use this setting.",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         else:  # keep the old default
             self.use_logits_to_keep = False
 
-        self.f_divergence_type = FDivergenceType(self.f_divergence_type)
+        if isinstance(self.f_divergence_type, FDivergenceType):
+            warnings.warn(
+                "`f_divergence_type` will require a string in 0.29.0; `FDivergenceType` is deprecated. Use one of: "
+                "`'reverse_kl'`, `'js_divergence'`, `'alpha_divergence'`.",
+                FutureWarning,
+                stacklevel=3,
+            )
+            self.f_divergence_type = self.f_divergence_type.value
 
         # Normalize loss_type to string format for internal use
         if hasattr(self.loss_type, "__len__") and len(self.loss_type) == 1:
@@ -747,5 +759,17 @@ class DPOConfig(TrainingArguments):
                     f"Length of loss_weights list ({self.loss_weights}) must match number of loss types "
                     f"({loss_types})."
                 )
+
+        if "aot_pair" in self.loss_type:
+            warnings.warn(
+                "The loss type 'aot_pair' has been renamed to 'aot_unpaired' and is deprecated. "
+                "It will be removed in version 0.29.0. Please use 'aot_unpaired' in `loss_type` instead.",
+                FutureWarning,
+                stacklevel=3,
+            )
+            if isinstance(self.loss_type, str):
+                self.loss_type = "aot_unpaired"
+            else:
+                self.loss_type = ["aot_unpaired" if lt == "aot_pair" else lt for lt in self.loss_type]
 
         super().__post_init__()

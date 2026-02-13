@@ -724,6 +724,24 @@ class SFTTrainer(BaseTrainer):
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
+        # PEFT + DeepSpeed ZeRO-3 requires reentrant checkpointing. For more details, see
+        # https://github.com/huggingface/trl/issues/2514#issuecomment-2692152703
+        if (
+            is_peft_model(model)
+            and args.deepspeed_plugin is not None
+            and args.deepspeed_plugin.zero_stage == 3
+            and args.gradient_checkpointing
+        ):
+            args.gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
+            use_reentrant = args.gradient_checkpointing_kwargs.get("use_reentrant")
+            if use_reentrant is False:
+                logger.warning(
+                    "You are using PEFT with DeepSpeed ZeRO-3 and gradient checkpointing with `use_reentrant=False`. "
+                    "`use_reentrant` is forced to `True` in this configuration to ensure correct training. To remove "
+                    "this warning, unset `use_reentrant` in `gradient_checkpointing_kwargs` or set it to `True`."
+                )
+            args.gradient_checkpointing_kwargs["use_reentrant"] = True
+
         # When using gradient checkpointing with PEFT, we need to enable input gradients. transformers.Trainer normally
         # handles this, but a bug currently prevents it; see https://github.com/huggingface/transformers/issues/42489
         if is_peft_available() and is_peft_model(model) and args.gradient_checkpointing:
@@ -879,6 +897,14 @@ class SFTTrainer(BaseTrainer):
                 compute_loss_func = dft_loss
             else:
                 raise ValueError(f"Invalid `loss_type` {args.loss_type} passed. Supported values are 'nll' and 'dft'.")
+
+        # Transformers explicitly set use_reentrant=True in the past to silence a PyTorch warning, but the default was
+        # never updated once PyTorch switched to recommending use_reentrant=False. Until that change lands upstream
+        # (see https://github.com/huggingface/transformers/pull/43203) and is released (most likely in 5.0.0), we
+        # default to the recommended non-reentrant behavior here, while preserving any user-provided value.
+        if args.gradient_checkpointing and Version(transformers.__version__) < Version("5.0.0"):
+            args.gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
+            args.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
 
         super().__init__(
             model=model,
@@ -1144,6 +1170,7 @@ class SFTTrainer(BaseTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         mode = "train" if self.model.training else "eval"
+        prediction_loss_only = inputs.pop("_prediction_loss_only", None)
 
         # Set aside labels as it will be dropped by super().compute_loss() if a custom `compute_loss_func` is used.
         # This can be removed when this issue is fixed.
@@ -1155,6 +1182,23 @@ class SFTTrainer(BaseTrainer):
 
         # Request token accuracy from Liger kernel and set token scaling if using DFT loss
         if self.args.use_liger_kernel:
+            # Avoid materializing full logits during eval unless explicitly needed.
+            # By default, liger kernel only skips logits during training (self.training=True).
+            # When only loss is needed for eval (no compute_metrics), we can safely skip logits.
+            # prediction_step communicates whether logits are expected via `_prediction_loss_only`;
+            # this prevents skipping logits during `predict()` where outputs are requested.
+            # Keep logits when preprocess_logits_for_metrics is set, even if compute_metrics is None.
+            # to prevent massive vRAM spikes from the lm_head projection.
+            # See: https://github.com/huggingface/trl/issues/4679
+            inputs["skip_logits"] = (
+                self.model.training
+                or self.args.prediction_loss_only
+                or (
+                    self.compute_metrics is None
+                    and self.preprocess_logits_for_metrics is None
+                    and prediction_loss_only is not False
+                )
+            )
             inputs["return_token_accuracy"] = True
             inputs["use_token_scaling"] = self.args.loss_type == "dft"
 
@@ -1257,6 +1301,11 @@ class SFTTrainer(BaseTrainer):
             self._metrics[mode]["aux_loss"].append(aux_loss)
 
         return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # Preserve the eval loop intent so compute_loss can decide whether logits are needed.
+        inputs["_prediction_loss_only"] = prediction_loss_only
+        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
 
     # Override training step to add activation offloading context.
     def training_step(self, *args, **kwargs):
