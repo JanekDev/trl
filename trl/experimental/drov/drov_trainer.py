@@ -705,6 +705,130 @@ class DROVTrainer(BaseTrainer):
             return loss.detach(), None, None
         return loss.detach(), None, None
 
+    @staticmethod
+    def _prompt_keys_from_batch(
+        prompt_input_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+    ) -> list[tuple[int, ...]]:
+        prompt_input_ids = prompt_input_ids.detach().cpu()
+        prompt_attention_mask = prompt_attention_mask.detach().cpu().to(torch.bool)
+        keys: list[tuple[int, ...]] = []
+        for ids, mask in zip(prompt_input_ids, prompt_attention_mask, strict=True):
+            keys.append(tuple(ids[mask].tolist()))
+        return keys
+
+    def _compute_policy_reward_metric(
+        self,
+        eval_dataset: Dataset | IterableDataset | None = None,
+    ) -> dict[str, float]:
+        if self.accelerator.num_processes > 1:
+            logger.warning(
+                "Skipping policy-weighted reward metric on multi-process evaluation. "
+                "It currently supports single-process only."
+            )
+            return {}
+
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            return {}
+        if isinstance(dataset, dict):
+            logger.warning("Skipping policy-weighted reward metric for dict eval datasets.")
+            return {}
+
+        was_training = self.model.training
+        self.model.eval()
+        policy_model = self.model.policy if hasattr(self.model, "policy") else self.model
+
+        grouped_logps: dict[tuple[int, ...], list[float]] = defaultdict(list)
+        grouped_rewards: dict[tuple[int, ...], list[float]] = defaultdict(list)
+
+        try:
+            dataloader = self.get_eval_dataloader(dataset)
+            for batch in dataloader:
+                prompt_input_ids = batch["prompt_input_ids"].to(self.accelerator.device)
+                prompt_attention_mask = batch["prompt_attention_mask"].to(self.accelerator.device)
+                completion_input_ids = batch["completion_input_ids"].to(self.accelerator.device)
+                completion_attention_mask = batch["completion_attention_mask"].to(self.accelerator.device)
+                rewards = batch["reward"].to(torch.float32)
+
+                with torch.no_grad():
+                    if self.is_encoder_decoder:
+                        labels = completion_input_ids.masked_fill(
+                            completion_attention_mask == 0,
+                            self.args.label_pad_token_id,
+                        )
+                        policy_outputs = policy_model(
+                            input_ids=prompt_input_ids,
+                            attention_mask=prompt_attention_mask,
+                            labels=labels,
+                            use_cache=False,
+                        )
+                        policy_logps = _sequence_log_probs(policy_outputs.logits, labels, self.args.label_pad_token_id)
+                    else:
+                        policy_logps = self._decoder_only_logps(
+                            policy_model,
+                            prompt_input_ids,
+                            prompt_attention_mask,
+                            completion_input_ids,
+                            completion_attention_mask,
+                        )
+
+                prompt_keys = self._prompt_keys_from_batch(batch["prompt_input_ids"], batch["prompt_attention_mask"])
+                policy_logps_list = policy_logps.detach().cpu().to(torch.float32).tolist()
+                rewards_list = rewards.detach().cpu().to(torch.float32).tolist()
+                for prompt_key, logp, reward in zip(prompt_keys, policy_logps_list, rewards_list, strict=True):
+                    grouped_logps[prompt_key].append(float(logp))
+                    grouped_rewards[prompt_key].append(float(reward))
+        finally:
+            if was_training:
+                self.model.train()
+
+        prompt_expected_rewards: list[float] = []
+        candidate_counts: list[int] = []
+        for prompt_key, logps in grouped_logps.items():
+            rewards_list = grouped_rewards[prompt_key]
+            if not logps:
+                continue
+            logps_tensor = torch.tensor(logps, dtype=torch.float32)
+            rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32)
+            weights = torch.softmax(logps_tensor, dim=0)
+            prompt_expected_rewards.append(torch.sum(weights * rewards_tensor).item())
+            candidate_counts.append(len(logps))
+
+        if not prompt_expected_rewards:
+            return {}
+
+        return {
+            "policy_reward_mean": float(torch.tensor(prompt_expected_rewards, dtype=torch.float32).mean().item()),
+            "policy_reward_prompt_count": float(len(prompt_expected_rewards)),
+            "policy_reward_candidates_per_prompt_mean": float(
+                torch.tensor(candidate_counts, dtype=torch.float32).mean().item()
+            ),
+        }
+
+    def evaluate(
+        self,
+        eval_dataset: Dataset | IterableDataset | dict[str, Dataset | IterableDataset] | None = None,
+        ignore_keys: list[str] | None = None,
+        metric_key_prefix: str = "eval",
+    ) -> dict[str, float]:
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+        policy_reward_metrics = self._compute_policy_reward_metric(
+            eval_dataset if isinstance(eval_dataset, (Dataset, IterableDataset)) else None
+        )
+        if not policy_reward_metrics:
+            return metrics
+
+        prefixed_metrics = {f"{metric_key_prefix}/{key}": value for key, value in policy_reward_metrics.items()}
+        metrics.update(prefixed_metrics)
+        self.log(prefixed_metrics)
+        return metrics
+
     def store_metrics(self, metrics: dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
         for key, value in metrics.items():
             self._stored_metrics[train_eval][key].append(value)
