@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import torch
 from datasets import Dataset
 from torch import nn
-from transformers import T5Config, T5ForConditionalGeneration
+from transformers import T5Config, T5ForConditionalGeneration, T5ForSequenceClassification
 
 from trl.experimental.drov import DROVConfig, DROVTrainer, DataCollatorForDROV
 from trl.experimental.drov.drov_trainer import compute_drov_residual_loss
@@ -241,3 +241,71 @@ class TestDROVTrainer(TrlTestCase):
         checkpoints = list(Path(self.tmp_dir).glob("checkpoint-*"))
         assert checkpoints
         assert (checkpoints[0] / "value_model" / "pytorch_model.bin").exists()
+
+    def test_prediction_step_eval_path(self):
+        policy_model = _build_policy_model()
+        ref_model = _build_policy_model()
+        dataset = _build_dataset()
+        args = DROVConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=2,
+            per_device_eval_batch_size=2,
+            max_steps=1,
+            gradient_accumulation_steps=1,
+            remove_unused_columns=False,
+            report_to="none",
+            bf16=False,
+            fp16=False,
+            disable_tqdm=True,
+            save_strategy="no",
+            eval_strategy="no",
+        )
+        trainer = DROVTrainer(
+            model=policy_model,
+            ref_model=ref_model,
+            value_model=TinyValueModel(),
+            args=args,
+            processing_class=DummyTokenizer(),
+            train_dataset=dataset,
+            eval_dataset=dataset,
+        )
+
+        batch = trainer.data_collator([dataset[0], dataset[1]])
+        loss, logits, labels = trainer.prediction_step(trainer.model, batch, prediction_loss_only=True)
+
+        assert loss is not None
+        assert logits is None
+        assert labels is None
+        assert trainer._stored_metrics["eval"]["loss/drov"]
+
+    def test_can_share_policy_and_value_backbone(self):
+        policy_model = _build_policy_model()
+        ref_model = _build_policy_model()
+        value_model = T5ForSequenceClassification(policy_model.config)
+        dataset = _build_dataset()
+        args = DROVConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=2,
+            max_steps=1,
+            gradient_accumulation_steps=1,
+            remove_unused_columns=False,
+            report_to="none",
+            bf16=False,
+            fp16=False,
+            disable_tqdm=True,
+            save_strategy="no",
+            eval_strategy="no",
+            share_policy_and_value_backbone=True,
+        )
+        trainer = DROVTrainer(
+            model=policy_model,
+            ref_model=ref_model,
+            value_model=value_model,
+            args=args,
+            processing_class=DummyTokenizer(),
+            train_dataset=dataset,
+        )
+
+        value_backbone = getattr(trainer.value_model, trainer.value_model.base_model_prefix)
+        assert value_backbone.encoder is trainer.policy_model.encoder
+        assert value_backbone.decoder is trainer.policy_model.decoder

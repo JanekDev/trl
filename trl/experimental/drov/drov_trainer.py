@@ -135,6 +135,24 @@ class DataCollatorForDROV(DataCollatorMixin):
         return output
 
 
+class PolicyAndValueWrapper(nn.Module):
+    """Container used so Trainer wraps policy and value modules together."""
+
+    def __init__(self, policy: nn.Module, value_model: nn.Module) -> None:
+        super().__init__()
+        self.policy = policy
+        self.value_model = value_model
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.policy(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.policy, name)
+
+
 class DROVTrainer(BaseTrainer):
     """
     Trainer for Distributional Regularized Offline Value Learning (DRO-V).
@@ -147,13 +165,14 @@ class DROVTrainer(BaseTrainer):
     _name = "DRO-V"
     _paper = {
         "title": "Offline Regularised Reinforcement Learning for Large Language Models Alignment",
-        "id": "2405.unknown",
+        "id": "2405.19107",
         # docstyle-ignore
         "citation": textwrap.dedent("""\
-            @article{offline2024distributional,
+            @article{richemond2024offline,
                 title        = {{Offline Regularised Reinforcement Learning for Large Language Models Alignment}},
+                author       = {Pierre Harvey Richemond and Yunhao Tang and Daniel Guo and Daniele Calandriello and Mohammad Gheshlaghi Azar and Rafael Rafailov and Bernardo Avila Pires and Eugene Tarassov and Lucas Spangher and Will Ellsworth and Aliaksei Severyn and Jonathan Mallinson and Lior Shani and Gil Shamir and Rishabh Joshi and Tianqi Liu and Remi Munos and Bilal Piot},
                 year         = 2024,
-                eprint       = {arXiv:2405.xxxxx},
+                eprint       = {arXiv:2405.19107},
             }"""),
     }
 
@@ -212,13 +231,17 @@ class DROVTrainer(BaseTrainer):
             model = get_peft_model(model, peft_config)
             self.is_peft_model = True
 
-        self.is_encoder_decoder = getattr(model.config, "is_encoder_decoder", False)
+        self.policy_model = model
         self.value_model = value_model
+        if args.share_policy_and_value_backbone:
+            self._share_policy_and_value_backbone()
+        self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
+        self.is_encoder_decoder = getattr(self.policy_model.config, "is_encoder_decoder", False)
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
         self._train_metrics_path = Path(args.output_dir) / "train_metrics.jsonl"
 
         if args.disable_dropout:
-            disable_dropout_in_model(model)
+            disable_dropout_in_model(self.policy_model)
             if self.ref_model is not None:
                 disable_dropout_in_model(self.ref_model)
             disable_dropout_in_model(self.value_model)
@@ -247,7 +270,7 @@ class DROVTrainer(BaseTrainer):
                 eval_dataset = self._prepare_dataset(eval_dataset, processing_class, args, "eval")
 
         super().__init__(
-            model=model,
+            model=self.model,
             args=args,
             data_collator=data_collator,
             train_dataset=train_dataset,
@@ -261,6 +284,8 @@ class DROVTrainer(BaseTrainer):
         # We compute custom loss, so we don't rely on model `loss` kwargs handling in parent trainer.
         self.model_accepts_loss_kwargs = False
 
+        self.model.config = self.policy_model.config
+
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
@@ -268,11 +293,44 @@ class DROVTrainer(BaseTrainer):
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
             self.ref_model.eval()
 
-        self.value_model = self.value_model.to(self.accelerator.device)
         self.value_model.train()
 
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)
+
+    def _share_policy_and_value_backbone(self) -> None:
+        if not hasattr(self.policy_model, "base_model_prefix"):
+            raise ValueError("Policy model must define `base_model_prefix` when sharing the value backbone.")
+        if not hasattr(self.value_model, "base_model_prefix"):
+            raise ValueError("Value model must define `base_model_prefix` when sharing the value backbone.")
+
+        policy_backbone_name = self.policy_model.base_model_prefix
+        value_backbone_name = self.value_model.base_model_prefix
+        policy_backbone = getattr(self.policy_model, policy_backbone_name, None)
+        value_backbone = getattr(self.value_model, value_backbone_name, None)
+        if value_backbone is None:
+            raise ValueError(f"Value model does not expose backbone attribute `{value_backbone_name}`.")
+
+        if policy_backbone is not None:
+            setattr(self.value_model, value_backbone_name, policy_backbone)
+        elif all(hasattr(self.policy_model, attr) for attr in ("shared", "encoder", "decoder")) and all(
+            hasattr(value_backbone, attr) for attr in ("shared", "encoder", "decoder")
+        ):
+            # T5-family fallback: share encoder/decoder stack when the policy does not expose `base_model_prefix`.
+            value_backbone.shared = self.policy_model.shared
+            value_backbone.encoder = self.policy_model.encoder
+            value_backbone.decoder = self.policy_model.decoder
+        else:
+            raise ValueError(
+                "Policy model does not expose a shareable backbone module for value sharing. "
+                f"Tried `{policy_backbone_name}` and T5-style `(shared, encoder, decoder)` fallback."
+            )
+
+        logger.info(
+            "Sharing policy backbone `%s` with value model backbone `%s`.",
+            policy_backbone_name,
+            value_backbone_name,
+        )
 
     def _prepare_dataset(
         self,
@@ -366,36 +424,48 @@ class DROVTrainer(BaseTrainer):
 
     @contextmanager
     def null_ref_context(self):
-        with self.accelerator.unwrap_model(self.model).disable_adapter() if self.is_peft_model else nullcontext():
+        policy_model = self.accelerator.unwrap_model(self.model).policy
+        with policy_model.disable_adapter() if self.is_peft_model else nullcontext():
             yield
 
     def create_optimizer(self) -> torch.optim.Optimizer:
         if self.optimizer is not None:
             return self.optimizer
 
-        policy_params = [p for p in self.model.parameters() if p.requires_grad]
+        policy_params = [p for p in self.policy_model.parameters() if p.requires_grad]
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
         if not policy_params:
             raise ValueError("No trainable policy parameters found.")
         if not value_params:
             raise ValueError("No trainable value parameters found.")
 
-        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, self.model)
-        self.optimizer = optimizer_cls(
-            [
+        policy_param_ids = {id(param) for param in policy_params}
+        shared_param_count = sum(id(param) in policy_param_ids for param in value_params)
+        value_only_params = [param for param in value_params if id(param) not in policy_param_ids]
+        if shared_param_count > 0:
+            logger.warning(
+                "Detected %d shared policy/value parameters; they will use policy learning rate.",
+                shared_param_count,
+            )
+
+        optimizer_param_groups = [
+            {
+                "params": policy_params,
+                "lr": self.args.policy_learning_rate / max(self.args.tau, 1e-12),
+                "weight_decay": self.args.weight_decay,
+            }
+        ]
+        if value_only_params:
+            optimizer_param_groups.append(
                 {
-                    "params": policy_params,
-                    "lr": self.args.policy_learning_rate / max(self.args.tau, 1e-12),
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": value_params,
+                    "params": value_only_params,
                     "lr": self.args.value_learning_rate,
                     "weight_decay": self.args.weight_decay,
-                },
-            ],
-            **optimizer_kwargs,
-        )
+                }
+            )
+
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, self.model)
+        self.optimizer = optimizer_cls(optimizer_param_groups, **optimizer_kwargs)
         return self.optimizer
 
     def _extract_value_predictions(
@@ -405,12 +475,18 @@ class DROVTrainer(BaseTrainer):
     ) -> torch.Tensor:
         if isinstance(value_output, torch.Tensor):
             values = value_output
-        elif hasattr(value_output, "values"):
-            values = value_output.values
-        elif hasattr(value_output, "value"):
-            values = value_output.value
-        elif hasattr(value_output, "logits"):
+        elif (
+            isinstance(value_output, (tuple, list))
+            and len(value_output) > 0
+            and isinstance(value_output[0], torch.Tensor)
+        ):
+            values = value_output[0]
+        elif hasattr(value_output, "logits") and isinstance(value_output.logits, torch.Tensor):
             values = value_output.logits
+        elif hasattr(value_output, "value") and isinstance(value_output.value, torch.Tensor):
+            values = value_output.value
+        elif hasattr(value_output, "values") and isinstance(value_output.values, torch.Tensor):
+            values = value_output.values
         else:
             raise ValueError(
                 "Unsupported value model output. Expected tensor, or output with `values`/`value`/`logits`."
@@ -426,6 +502,32 @@ class DROVTrainer(BaseTrainer):
             raise ValueError(f"Unsupported value tensor shape {tuple(values.shape)}. Expected [B] or [B,1].")
 
         return values.to(torch.float32)
+
+    def _forward_value_model(
+        self,
+        value_model: nn.Module,
+        prompt_input_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+    ) -> Any:
+        try:
+            return value_model(
+                input_ids=prompt_input_ids,
+                attention_mask=prompt_attention_mask,
+            )
+        except TypeError as error:
+            if not hasattr(value_model, "score"):
+                raise
+            if not hasattr(value_model, "base_model_prefix"):
+                raise ValueError("Value model fallback requires both `score` and `base_model_prefix`.") from error
+            critic_backbone = getattr(value_model, value_model.base_model_prefix)
+            backbone_outputs = critic_backbone(
+                input_ids=prompt_input_ids,
+                attention_mask=prompt_attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            hidden_states = backbone_outputs.hidden_states[-1]
+            return value_model.score(hidden_states)
 
     def _forward_ref_encoder_decoder(
         self,
@@ -513,13 +615,15 @@ class DROVTrainer(BaseTrainer):
         completion_input_ids = batch["completion_input_ids"]
         completion_attention_mask = batch["completion_attention_mask"]
         rewards = batch["reward"].to(torch.float32)
+        policy_model = model.policy if hasattr(model, "policy") else model
+        value_model = model.value_model if hasattr(model, "value_model") else self.value_model
 
         if self.is_encoder_decoder:
             labels = completion_input_ids.masked_fill(
                 completion_attention_mask == 0,
                 self.args.label_pad_token_id,
             )
-            policy_outputs = model(
+            policy_outputs = policy_model(
                 input_ids=prompt_input_ids,
                 attention_mask=prompt_attention_mask,
                 labels=labels,
@@ -530,7 +634,7 @@ class DROVTrainer(BaseTrainer):
             ref_logps = _sequence_log_probs(ref_logits, labels, self.args.label_pad_token_id)
         else:
             policy_logps = self._decoder_only_logps(
-                model,
+                policy_model,
                 prompt_input_ids,
                 prompt_attention_mask,
                 completion_input_ids,
@@ -543,9 +647,10 @@ class DROVTrainer(BaseTrainer):
                 completion_attention_mask,
             )
 
-        value_outputs = self.value_model(
-            input_ids=prompt_input_ids,
-            attention_mask=prompt_attention_mask,
+        value_outputs = self._forward_value_model(
+            value_model,
+            prompt_input_ids,
+            prompt_attention_mask,
         )
         values = self._extract_value_predictions(value_outputs, prompt_attention_mask)
 
@@ -584,6 +689,22 @@ class DROVTrainer(BaseTrainer):
             return loss, metrics
         return loss
 
+    def prediction_step(
+        self,
+        model: PreTrainedModel | nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        prediction_loss_only: bool,
+        ignore_keys: list[str] | None = None,
+    ) -> tuple[torch.Tensor, None, None]:
+        del ignore_keys
+        with torch.no_grad():
+            loss, metrics = self.get_batch_loss_metrics(model, inputs)
+        self.store_metrics(metrics, train_eval="eval")
+
+        if prediction_loss_only:
+            return loss.detach(), None, None
+        return loss.detach(), None, None
+
     def store_metrics(self, metrics: dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
         for key, value in metrics.items():
             self._stored_metrics[train_eval][key].append(value)
@@ -602,16 +723,44 @@ class DROVTrainer(BaseTrainer):
 
         return super().log(logs, start_time)
 
+    def _save_value_model(self, output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        unwrapped_value_model = (
+            unwrapped_model.value_model if hasattr(unwrapped_model, "value_model") else self.value_model
+        )
+        if hasattr(unwrapped_value_model, "save_pretrained"):
+            unwrapped_value_model.save_pretrained(output_dir)
+        else:
+            torch.save(unwrapped_value_model.state_dict(), output_dir / "pytorch_model.bin")
+
+    def save_model(self, output_dir: str | None = None, _internal_call: bool = False):
+        backup_model = self.model
+        self.model = self.model.policy
+
+        if self.is_deepspeed_enabled:
+            backup_deepspeed = self.deepspeed
+            self.deepspeed = self.model
+
+        try:
+            super().save_model(output_dir, _internal_call)
+        finally:
+            self.model = backup_model
+            if self.is_deepspeed_enabled:
+                self.deepspeed = backup_deepspeed
+
+        save_dir = Path(output_dir) if output_dir is not None else Path(self.args.output_dir)
+        self._save_value_model(save_dir / "value_model")
+
     def _save_checkpoint(self, model, trial) -> None:
-        super()._save_checkpoint(model, trial)
+        del model
+        backup_model = self.model
+        self.model = self.model.policy
+        try:
+            super()._save_checkpoint(self.model, trial)
+        finally:
+            self.model = backup_model
 
         checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
         output_dir = Path(self.args.output_dir) / checkpoint_folder
-        value_dir = output_dir / "value_model"
-        value_dir.mkdir(parents=True, exist_ok=True)
-
-        unwrapped_value_model = self.accelerator.unwrap_model(self.value_model)
-        if hasattr(unwrapped_value_model, "save_pretrained"):
-            unwrapped_value_model.save_pretrained(value_dir)
-        else:
-            torch.save(unwrapped_value_model.state_dict(), value_dir / "pytorch_model.bin")
+        self._save_value_model(output_dir / "value_model")

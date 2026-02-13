@@ -2,12 +2,29 @@
 Run a basic DRO-V experiment inspired by the paper:
 "Offline Regularised Reinforcement Learning for Large Language Models Alignment".
 
-Example:
+Overfit one batch (sanity check):
 python examples/scripts/drov.py \
-    --output_dir flan-t5-large-drov \
+    --output_dir drov-overfit-one-batch \
     --dataset_revision <ultrafeedback_commit_or_tag> \
     --model_name_or_path google/flan-t5-large \
+    --overfit_one_batch \
+    --overfit_steps 300 \
+    --per_device_train_batch_size 8 \
+    --gradient_accumulation_steps 1
+
+Paper-style training run (single eval fold):
+python examples/scripts/drov.py \
+    --output_dir drov-paper-t5-large-fold0 \
+    --dataset_revision <ultrafeedback_commit_or_tag> \
+    --model_name_or_path google/flan-t5-large \
+    --num_eval_folds 5 \
+    --eval_fold_index 0 \
+    --eval_prompts_per_fold 1000 \
+    --tau 1.0 \
+    --policy_learning_rate 1e-4 \
+    --value_learning_rate 1e-4 \
     --max_steps 40000 \
+    --warmup_steps 150 \
     --per_device_train_batch_size 32
 
 Quick smoke run:
@@ -25,64 +42,14 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
-from torch import nn
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoModelForSequenceClassification, AutoTokenizer
 
 from trl.experimental.drov import DROVConfig, DROVTrainer
-
-
-@dataclass
-class ValueModelOutput:
-    values: torch.Tensor
-
-
-class EncoderDecoderValueModel(nn.Module):
-    """Value model V(x) built from a seq2seq encoder backbone plus scalar head."""
-
-    def __init__(self, backbone: AutoModelForSeq2SeqLM):
-        super().__init__()
-        self.backbone = backbone
-        hidden_size = (
-            getattr(backbone.config, "d_model", None)
-            or getattr(backbone.config, "hidden_size", None)
-            or getattr(backbone.config, "decoder_hidden_size", None)
-        )
-        if hidden_size is None:
-            raise ValueError("Could not infer hidden size for value head from model config.")
-        self.value_head = nn.Linear(hidden_size, 1)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_name_or_path: str,
-        trust_remote_code: bool = False,
-        torch_dtype: torch.dtype | None = None,
-    ) -> "EncoderDecoderValueModel":
-        backbone = AutoModelForSeq2SeqLM.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            torch_dtype=torch_dtype,
-        )
-        return cls(backbone)
-
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> ValueModelOutput:
-        encoder = self.backbone.get_encoder()
-        hidden_states = encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-        ).last_hidden_state
-
-        mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
-        pooled = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
-        values = self.value_head(pooled).squeeze(-1)
-        return ValueModelOutput(values=values)
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,6 +94,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--policy_learning_rate", type=float, default=1e-4)
     parser.add_argument("--value_learning_rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--share_policy_and_value_backbone",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Share policy backbone parameters with the value model backbone to reduce memory usage.",
+    )
 
     parser.add_argument("--per_device_train_batch_size", type=int, default=32)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=32)
@@ -135,6 +108,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_steps", type=int, default=150)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=2000)
+    parser.add_argument(
+        "--overfit_one_batch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable one-batch overfitting sanity mode. "
+            "This limits train samples to a single optimization batch and disables eval."
+        ),
+    )
+    parser.add_argument(
+        "--overfit_steps",
+        type=int,
+        default=300,
+        help="Training steps to run when --overfit_one_batch is enabled.",
+    )
 
     parser.add_argument("--max_prompt_length", type=int, default=512)
     parser.add_argument("--max_completion_length", type=int, default=512)
@@ -230,7 +218,12 @@ def _split_triplets_by_prompt_folds(triplets: Dataset, args: argparse.Namespace)
     return DatasetDict({"train": train_dataset, "test": eval_dataset})
 
 
-def _save_prompt_split_manifest(dataset: DatasetDict, args: argparse.Namespace) -> None:
+def _save_prompt_split_manifest(
+    dataset: DatasetDict,
+    args: argparse.Namespace,
+    reward_mean: float | None = None,
+    reward_std: float | None = None,
+) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "prompt_split_manifest.json"
@@ -251,7 +244,41 @@ def _save_prompt_split_manifest(dataset: DatasetDict, args: argparse.Namespace) 
         "train_unique_prompts": len(set(dataset["train"]["prompt"])),
         "eval_unique_prompts": len(set(dataset["test"]["prompt"])),
     }
+    if reward_mean is not None:
+        manifest["train_reward_mean_before_norm"] = reward_mean
+    if reward_std is not None:
+        manifest["train_reward_std_before_norm"] = reward_std
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def _normalize_reward_row(row: dict[str, float], reward_mean: float, reward_std: float) -> dict[str, float]:
+    return {"reward": (float(row["reward"]) - reward_mean) / reward_std}
+
+
+def _share_policy_backbone_with_value_model(model: torch.nn.Module, value_model: torch.nn.Module) -> None:
+    if not hasattr(model, "base_model_prefix") or not hasattr(value_model, "base_model_prefix"):
+        raise ValueError("Backbone sharing requires both policy and value models to define `base_model_prefix`.")
+
+    policy_backbone_name = model.base_model_prefix
+    value_backbone_name = value_model.base_model_prefix
+    policy_backbone = getattr(model, policy_backbone_name, None)
+    value_backbone = getattr(value_model, value_backbone_name, None)
+    if value_backbone is None:
+        raise ValueError("Backbone sharing failed because the value model does not expose its backbone module.")
+
+    if policy_backbone is not None:
+        setattr(value_model, value_backbone_name, policy_backbone)
+    elif all(hasattr(model, attr) for attr in ("shared", "encoder", "decoder")) and all(
+        hasattr(value_backbone, attr) for attr in ("shared", "encoder", "decoder")
+    ):
+        value_backbone.shared = model.shared
+        value_backbone.encoder = model.encoder
+        value_backbone.decoder = model.decoder
+    else:
+        raise ValueError(
+            "Backbone sharing failed because the policy does not expose a shareable backbone module "
+            f"for `{policy_backbone_name}`."
+        )
 
 
 def prepare_triplet_dataset(args: argparse.Namespace) -> DatasetDict:
@@ -272,20 +299,27 @@ def prepare_triplet_dataset(args: argparse.Namespace) -> DatasetDict:
     if len(triplets) == 0:
         raise ValueError("No triplets were produced from the dataset with the current filters.")
 
-    reward_values = np.asarray(triplets["reward"], dtype=np.float32)
-    reward_mean = float(reward_values.mean())
-    reward_std = float(reward_values.std())
-    if reward_std < 1e-6:
-        reward_std = 1.0
-    triplets = triplets.map(
-        lambda row: {"reward": (float(row["reward"]) - reward_mean) / reward_std},
-        num_proc=args.dataset_num_proc,
-        desc="Normalizing rewards to mean 0 / std 1",
-    )
-
     dataset = _split_triplets_by_prompt_folds(triplets, args)
     train_dataset: Dataset = dataset["train"]
     eval_dataset: Dataset = dataset["test"]
+
+    train_reward_values = np.asarray(train_dataset["reward"], dtype=np.float32)
+    reward_mean = float(train_reward_values.mean())
+    reward_std = float(train_reward_values.std())
+    if reward_std < 1e-6:
+        reward_std = 1.0
+    train_dataset = train_dataset.map(
+        _normalize_reward_row,
+        num_proc=args.dataset_num_proc,
+        fn_kwargs={"reward_mean": reward_mean, "reward_std": reward_std},
+        desc="Normalizing train rewards to mean 0 / std 1",
+    )
+    eval_dataset = eval_dataset.map(
+        _normalize_reward_row,
+        num_proc=args.dataset_num_proc,
+        fn_kwargs={"reward_mean": reward_mean, "reward_std": reward_std},
+        desc="Normalizing eval rewards with train statistics",
+    )
 
     if args.max_train_samples is not None:
         train_dataset = train_dataset.select(range(min(args.max_train_samples, len(train_dataset))))
@@ -294,12 +328,32 @@ def prepare_triplet_dataset(args: argparse.Namespace) -> DatasetDict:
 
     split_dataset = DatasetDict({"train": train_dataset, "test": eval_dataset})
     if args.save_prompt_splits:
-        _save_prompt_split_manifest(split_dataset, args)
+        _save_prompt_split_manifest(split_dataset, args, reward_mean=reward_mean, reward_std=reward_std)
     return split_dataset
+
+
+def _apply_overfit_one_batch_mode(args: argparse.Namespace) -> None:
+    if not args.overfit_one_batch:
+        return
+
+    if args.overfit_steps <= 0:
+        raise ValueError("--overfit_steps must be a positive integer when --overfit_one_batch is enabled.")
+
+    one_batch_size = args.per_device_train_batch_size * max(args.gradient_accumulation_steps, 1)
+    if args.max_train_samples is None or args.max_train_samples > one_batch_size:
+        args.max_train_samples = one_batch_size
+    if args.max_eval_samples is None:
+        args.max_eval_samples = one_batch_size
+
+    args.max_steps = args.overfit_steps
+    args.warmup_steps = 0
+    args.logging_steps = 1
+    args.save_steps = max(1, min(args.save_steps, args.overfit_steps))
 
 
 def main() -> None:
     args = parse_args()
+    _apply_overfit_one_batch_mode(args)
     torch_dtype = _parse_dtype(args.dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
@@ -316,40 +370,50 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         torch_dtype=torch_dtype,
     )
-    value_model = EncoderDecoderValueModel.from_pretrained(
+    value_model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         trust_remote_code=args.trust_remote_code,
         torch_dtype=torch_dtype,
+        num_labels=1,
     )
+    if args.share_policy_and_value_backbone:
+        _share_policy_backbone_with_value_model(model, value_model)
 
     dataset = prepare_triplet_dataset(args)
 
-    training_args = DROVConfig(
-        output_dir=args.output_dir,
-        seed=args.seed,
-        max_steps=args.max_steps,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps,
-        logging_steps=args.logging_steps,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        eval_strategy="steps",
-        eval_steps=args.save_steps,
-        report_to=args.report_to,
-        remove_unused_columns=False,
-        optim="adafactor",
-        lr_scheduler_type="linear",
-        tau=args.tau,
-        policy_learning_rate=args.policy_learning_rate,
-        value_learning_rate=args.value_learning_rate,
-        learning_rate=args.policy_learning_rate,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        bf16=args.bf16,
-        fp16=args.fp16,
-    )
+    training_kwargs = {
+        "output_dir": args.output_dir,
+        "seed": args.seed,
+        "max_steps": args.max_steps,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "per_device_eval_batch_size": args.per_device_eval_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "warmup_steps": args.warmup_steps,
+        "logging_steps": args.logging_steps,
+        "save_strategy": "steps",
+        "save_steps": args.save_steps,
+        "report_to": args.report_to,
+        "remove_unused_columns": False,
+        "optim": "adafactor",
+        "lr_scheduler_type": "linear",
+        "tau": args.tau,
+        "policy_learning_rate": args.policy_learning_rate,
+        "value_learning_rate": args.value_learning_rate,
+        "share_policy_and_value_backbone": args.share_policy_and_value_backbone,
+        "learning_rate": args.policy_learning_rate,
+        "max_prompt_length": args.max_prompt_length,
+        "max_completion_length": args.max_completion_length,
+        "bf16": args.bf16,
+        "fp16": args.fp16,
+    }
+    if args.overfit_one_batch:
+        training_kwargs["eval_strategy"] = "no"
+    else:
+        training_kwargs["eval_strategy"] = "steps"
+        training_kwargs["eval_steps"] = args.save_steps
+    training_args = DROVConfig(**training_kwargs)
+
+    eval_dataset = None if args.overfit_one_batch else dataset["test"]
 
     trainer = DROVTrainer(
         model=model,
@@ -357,7 +421,7 @@ def main() -> None:
         ref_model=ref_model,
         args=training_args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["test"],
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
     )
     trainer.train()

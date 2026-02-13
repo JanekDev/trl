@@ -86,6 +86,15 @@ class DROVConfig(TrainingArguments):
         default=True,
         metadata={"help": "Whether to disable dropout in policy, reference, and value models."},
     )
+    share_policy_and_value_backbone: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to share the policy backbone parameters with the value model backbone. "
+                "This reduces memory usage by keeping a separate value head on top of the policy backbone."
+            )
+        },
+    )
     dataset_num_proc: int | None = field(
         default=None,
         metadata={"help": "Number of processes for dataset preprocessing."},
