@@ -39,7 +39,7 @@ from transformers.data.data_collator import DataCollatorMixin
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import is_peft_available
 
-from ...data_utils import is_conversational, maybe_apply_chat_template, maybe_extract_prompt
+
 from ...models.utils import create_reference_model, prepare_deepspeed
 from ...trainer.base_trainer import BaseTrainer
 from ...trainer.utils import create_model_from_path, disable_dropout_in_model, pad
@@ -56,7 +56,7 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-def _sequence_log_probs(logits: torch.Tensor, labels: torch.Tensor, label_pad_token_id: int) -> torch.Tensor:
+def sequence_log_probs(logits: torch.Tensor, labels: torch.Tensor, label_pad_token_id: int) -> torch.Tensor:
     """Compute log-probability per sequence from token logits and labels."""
     log_probs = torch.log_softmax(logits, dim=-1)
     safe_labels = labels.masked_fill(labels == label_pad_token_id, 0)
@@ -161,21 +161,6 @@ class DROVTrainer(BaseTrainer):
         0.5 * E[(r(x,y) - V(x) - tau * log(pi(y|x)/pi_ref(y|x)))^2]
     """
 
-    _tag_names = ["trl", "drov"]
-    _name = "DRO-V"
-    _paper = {
-        "title": "Offline Regularised Reinforcement Learning for Large Language Models Alignment",
-        "id": "2405.19107",
-        # docstyle-ignore
-        "citation": textwrap.dedent("""\
-            @article{richemond2024offline,
-                title        = {{Offline Regularised Reinforcement Learning for Large Language Models Alignment}},
-                author       = {Pierre Harvey Richemond and Yunhao Tang and Daniel Guo and Daniele Calandriello and Mohammad Gheshlaghi Azar and Rafael Rafailov and Bernardo Avila Pires and Eugene Tarassov and Lucas Spangher and Will Ellsworth and Aliaksei Severyn and Jonathan Mallinson and Lior Shani and Gil Shamir and Rishabh Joshi and Tianqi Liu and Remi Munos and Bilal Piot},
-                year         = 2024,
-                eprint       = {arXiv:2405.19107},
-            }"""),
-    }
-
     def __init__(
         self,
         model: str | nn.Module | PreTrainedModel,
@@ -195,46 +180,12 @@ class DROVTrainer(BaseTrainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         peft_config: Any | None = None,
     ) -> None:
-        if args is None:
-            args = DROVConfig(output_dir="tmp_drov_trainer")
 
-        if isinstance(model, str):
-            model_init_kwargs = args.model_init_kwargs or {}
-            model = create_model_from_path(model, **model_init_kwargs)
-
-        if isinstance(ref_model, str):
-            ref_model = create_model_from_path(ref_model)
-
-        if ref_model is model:
-            raise ValueError(
-                "`model` and `ref_model` cannot be the same object. Pass `ref_model=None` to auto-create a reference."
-            )
-
-        self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
         self.ref_model = ref_model
-        if self.ref_model is None and not self.is_peft_model:
-            self.ref_model = create_reference_model(model)
-
-        if peft_config is not None:
-            if not is_peft_available():
-                raise ValueError("PEFT is not installed but `peft_config` was provided.")
-            if isinstance(model, PeftModel):
-                raise ValueError("Received a PeftModel and `peft_config`. Pass either one, not both.")
-            if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
-                supports_gc_kwargs = "gradient_checkpointing_kwargs" in inspect.signature(
-                    prepare_model_for_kbit_training
-                ).parameters
-                prepare_model_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
-                if supports_gc_kwargs:
-                    prepare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
-                model = prepare_model_for_kbit_training(model, **prepare_model_kwargs)
-            model = get_peft_model(model, peft_config)
-            self.is_peft_model = True
-
         self.policy_model = model
         self.value_model = value_model
         if args.share_policy_and_value_backbone:
-            self._share_policy_and_value_backbone()
+            self.share_policy_and_value_backbone()
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
         self.is_encoder_decoder = getattr(self.policy_model.config, "is_encoder_decoder", False)
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
@@ -259,15 +210,9 @@ class DROVTrainer(BaseTrainer):
             data_collator = DataCollatorForDROV(pad_token_id=pad_token_id)
 
         if train_dataset is not None:
-            train_dataset = self._prepare_dataset(train_dataset, processing_class, args, "train")
+            train_dataset = self.prepare_dataset(train_dataset, processing_class, args, "train")
         if eval_dataset is not None:
-            if isinstance(eval_dataset, dict):
-                eval_dataset = {
-                    key: self._prepare_dataset(dataset, processing_class, args, f"eval[{key}]")
-                    for key, dataset in eval_dataset.items()
-                }
-            else:
-                eval_dataset = self._prepare_dataset(eval_dataset, processing_class, args, "eval")
+            eval_dataset = self.prepare_dataset(eval_dataset, processing_class, args, "eval")
 
         super().__init__(
             model=self.model,
@@ -295,116 +240,50 @@ class DROVTrainer(BaseTrainer):
 
         self.value_model.train()
 
-        if hasattr(self.model, "add_model_tags"):
-            self.model.add_model_tags(self._tag_names)
-
-    def _share_policy_and_value_backbone(self) -> None:
-        if not hasattr(self.policy_model, "base_model_prefix"):
-            raise ValueError("Policy model must define `base_model_prefix` when sharing the value backbone.")
-        if not hasattr(self.value_model, "base_model_prefix"):
-            raise ValueError("Value model must define `base_model_prefix` when sharing the value backbone.")
-
-        policy_backbone_name = self.policy_model.base_model_prefix
-        value_backbone_name = self.value_model.base_model_prefix
-        policy_backbone = getattr(self.policy_model, policy_backbone_name, None)
-        value_backbone = getattr(self.value_model, value_backbone_name, None)
+    def share_policy_and_value_backbone(self) -> None:
+        """Share the transformer backbone between policy and value models."""
+        value_backbone = getattr(self.value_model, self.value_model.base_model_prefix, None)
         if value_backbone is None:
-            raise ValueError(f"Value model does not expose backbone attribute `{value_backbone_name}`.")
+            raise ValueError("Value model does not expose a backbone attribute.")
+        value_backbone.shared = self.policy_model.shared
+        value_backbone.encoder = self.policy_model.encoder
+        value_backbone.decoder = self.policy_model.decoder
+        logger.info("Shared policy encoder/decoder/embeddings with value model.")
 
-        if policy_backbone is not None:
-            setattr(self.value_model, value_backbone_name, policy_backbone)
-        elif all(hasattr(self.policy_model, attr) for attr in ("shared", "encoder", "decoder")) and all(
-            hasattr(value_backbone, attr) for attr in ("shared", "encoder", "decoder")
-        ):
-            # T5-family fallback: share encoder/decoder stack when the policy does not expose `base_model_prefix`.
-            value_backbone.shared = self.policy_model.shared
-            value_backbone.encoder = self.policy_model.encoder
-            value_backbone.decoder = self.policy_model.decoder
-        else:
-            raise ValueError(
-                "Policy model does not expose a shareable backbone module for value sharing. "
-                f"Tried `{policy_backbone_name}` and T5-style `(shared, encoder, decoder)` fallback."
-            )
-
-        logger.info(
-            "Sharing policy backbone `%s` with value model backbone `%s`.",
-            policy_backbone_name,
-            value_backbone_name,
-        )
-
-    def _prepare_dataset(
+    def prepare_dataset(
         self,
-        dataset: Dataset | IterableDataset,
-        processing_class: PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin,
+        dataset: Dataset,
+        processing_class: PreTrainedTokenizerBase,
         args: DROVConfig,
         dataset_name: str,
-    ) -> Dataset | IterableDataset:
-        required_columns = {"prompt_input_ids", "completion_input_ids"}
-        if required_columns.issubset(set(dataset.column_names)) and (
-            "reward" in dataset.column_names or "reward_z" in dataset.column_names or "label" in dataset.column_names
-        ):
-            return dataset
-
-        if not isinstance(processing_class, PreTrainedTokenizerBase):
-            raise ValueError("DROVTrainer requires a tokenizer-like `processing_class` for text preprocessing.")
-
-        map_kwargs = {}
-        if isinstance(dataset, Dataset):
-            map_kwargs["num_proc"] = args.dataset_num_proc
-            map_kwargs["writer_batch_size"] = 10
-
+    ) -> Dataset:
+        """Tokenize a dataset with prompt/completion/reward text columns."""
         with PartialState().main_process_first():
-            if isinstance(dataset, Dataset):
-                map_kwargs["desc"] = f"Extracting prompt in {dataset_name} dataset"
-            dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
-
-            is_chat = is_conversational(next(iter(dataset)))
-            if isinstance(dataset, Dataset):
-                map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
-            dataset = dataset.map(maybe_apply_chat_template, fn_kwargs={"tokenizer": processing_class}, **map_kwargs)
-
-            if isinstance(dataset, Dataset):
-                map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
             dataset = dataset.map(
                 self.tokenize_row,
                 fn_kwargs={
-                    "processing_class": processing_class,
+                    "tokenizer": processing_class,
                     "max_prompt_length": args.max_prompt_length,
                     "max_completion_length": args.max_completion_length,
-                    "add_special_tokens": self.is_encoder_decoder,
-                    "is_chat": is_chat,
                 },
-                **map_kwargs,
+                num_proc=args.dataset_num_proc,
+                desc=f"Tokenizing {dataset_name} dataset",
             )
-
         return dataset
 
     @staticmethod
     def tokenize_row(
         features: dict[str, Any],
-        processing_class: PreTrainedTokenizerBase,
+        tokenizer: PreTrainedTokenizerBase,
         max_prompt_length: int | None = None,
         max_completion_length: int | None = None,
-        add_special_tokens: bool = True,
-        is_chat: bool = False,
     ) -> dict[str, Any]:
-        tokenizer = processing_class
-        if "prompt" not in features:
-            raise KeyError("DRO-V dataset row must contain `prompt`.")
-        if "completion" not in features:
-            raise KeyError("DRO-V dataset row must contain `completion`.")
-
         prompt_input_ids = tokenizer(features["prompt"], add_special_tokens=False)["input_ids"]
         completion_input_ids = tokenizer(features["completion"], add_special_tokens=False)["input_ids"]
 
-        if add_special_tokens:
-            if tokenizer.bos_token_id is not None:
-                prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
-            if tokenizer.eos_token_id is not None:
-                prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
-
-        if not is_chat and tokenizer.eos_token_id is not None:
-            if len(completion_input_ids) == 0 or completion_input_ids[-1] != tokenizer.eos_token_id:
+        if tokenizer.eos_token_id is not None:
+            prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+            if not completion_input_ids or completion_input_ids[-1] != tokenizer.eos_token_id:
                 completion_input_ids = completion_input_ids + [tokenizer.eos_token_id]
 
         if max_prompt_length is not None:
@@ -412,14 +291,10 @@ class DROVTrainer(BaseTrainer):
         if max_completion_length is not None:
             completion_input_ids = completion_input_ids[:max_completion_length]
 
-        reward = features.get("reward", features.get("reward_z", features.get("label")))
-        if reward is None:
-            raise KeyError("DRO-V dataset row must contain one of: `reward`, `reward_z`, or `label`.")
-
         return {
             "prompt_input_ids": prompt_input_ids,
             "completion_input_ids": completion_input_ids,
-            "reward": float(reward),
+            "reward": float(features["reward"]),
         }
 
     @contextmanager
@@ -451,7 +326,7 @@ class DROVTrainer(BaseTrainer):
         optimizer_param_groups = [
             {
                 "params": policy_params,
-                "lr": self.args.policy_learning_rate / max(self.args.tau, 1e-12),
+                "lr": self.args.learning_rate / max(self.args.tau, 1e-12),
                 "weight_decay": self.args.weight_decay,
             }
         ]
@@ -468,7 +343,7 @@ class DROVTrainer(BaseTrainer):
         self.optimizer = optimizer_cls(optimizer_param_groups, **optimizer_kwargs)
         return self.optimizer
 
-    def _extract_value_predictions(
+    def extract_value_predictions(
         self,
         value_output: Any,
         prompt_attention_mask: torch.Tensor,
@@ -503,7 +378,7 @@ class DROVTrainer(BaseTrainer):
 
         return values.to(torch.float32)
 
-    def _forward_value_model(
+    def forward_value_model(
         self,
         value_model: nn.Module,
         prompt_input_ids: torch.Tensor,
@@ -529,7 +404,7 @@ class DROVTrainer(BaseTrainer):
             hidden_states = backbone_outputs.hidden_states[-1]
             return value_model.score(hidden_states)
 
-    def _forward_ref_encoder_decoder(
+    def forward_ref_encoder_decoder(
         self,
         prompt_input_ids: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
@@ -551,7 +426,7 @@ class DROVTrainer(BaseTrainer):
                 use_cache=False,
             ).logits
 
-    def _decoder_only_logps(
+    def decoder_only_logps(
         self,
         model: PreTrainedModel | nn.Module,
         prompt_input_ids: torch.Tensor,
@@ -576,7 +451,7 @@ class DROVTrainer(BaseTrainer):
         token_logps = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
         return (token_logps * target_mask).sum(dim=-1)
 
-    def _reference_decoder_only_logps(
+    def reference_decoder_only_logps(
         self,
         prompt_input_ids: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
@@ -585,7 +460,7 @@ class DROVTrainer(BaseTrainer):
     ) -> torch.Tensor:
         if self.ref_model is not None:
             with torch.no_grad():
-                return self._decoder_only_logps(
+                return self.decoder_only_logps(
                     self.ref_model,
                     prompt_input_ids,
                     prompt_attention_mask,
@@ -593,7 +468,7 @@ class DROVTrainer(BaseTrainer):
                     completion_attention_mask,
                 )
         with torch.no_grad(), self.null_ref_context():
-            return self._decoder_only_logps(
+            return self.decoder_only_logps(
                 self.model,
                 prompt_input_ids,
                 prompt_attention_mask,
@@ -629,30 +504,30 @@ class DROVTrainer(BaseTrainer):
                 labels=labels,
                 use_cache=False,
             )
-            policy_logps = _sequence_log_probs(policy_outputs.logits, labels, self.args.label_pad_token_id)
-            ref_logits = self._forward_ref_encoder_decoder(prompt_input_ids, prompt_attention_mask, labels)
-            ref_logps = _sequence_log_probs(ref_logits, labels, self.args.label_pad_token_id)
+            policy_logps = sequence_log_probs(policy_outputs.logits, labels, self.args.label_pad_token_id)
+            ref_logits = self.forward_ref_encoder_decoder(prompt_input_ids, prompt_attention_mask, labels)
+            ref_logps = sequence_log_probs(ref_logits, labels, self.args.label_pad_token_id)
         else:
-            policy_logps = self._decoder_only_logps(
+            policy_logps = self.decoder_only_logps(
                 policy_model,
                 prompt_input_ids,
                 prompt_attention_mask,
                 completion_input_ids,
                 completion_attention_mask,
             )
-            ref_logps = self._reference_decoder_only_logps(
+            ref_logps = self.reference_decoder_only_logps(
                 prompt_input_ids,
                 prompt_attention_mask,
                 completion_input_ids,
                 completion_attention_mask,
             )
 
-        value_outputs = self._forward_value_model(
+        value_outputs = self.forward_value_model(
             value_model,
             prompt_input_ids,
             prompt_attention_mask,
         )
-        values = self._extract_value_predictions(value_outputs, prompt_attention_mask)
+        values = self.extract_value_predictions(value_outputs, prompt_attention_mask)
 
         loss, delta, log_ratio = compute_drov_residual_loss(
             rewards=rewards,
@@ -706,7 +581,7 @@ class DROVTrainer(BaseTrainer):
         return loss.detach(), None, None
 
     @staticmethod
-    def _prompt_keys_from_batch(
+    def prompt_keys_from_batch(
         prompt_input_ids: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
     ) -> list[tuple[int, ...]]:
@@ -717,7 +592,7 @@ class DROVTrainer(BaseTrainer):
             keys.append(tuple(ids[mask].tolist()))
         return keys
 
-    def _compute_policy_reward_metric(
+    def compute_policy_reward_metric(
         self,
         eval_dataset: Dataset | IterableDataset | None = None,
     ) -> dict[str, float]:
@@ -763,9 +638,9 @@ class DROVTrainer(BaseTrainer):
                             labels=labels,
                             use_cache=False,
                         )
-                        policy_logps = _sequence_log_probs(policy_outputs.logits, labels, self.args.label_pad_token_id)
+                        policy_logps = sequence_log_probs(policy_outputs.logits, labels, self.args.label_pad_token_id)
                     else:
-                        policy_logps = self._decoder_only_logps(
+                        policy_logps = self.decoder_only_logps(
                             policy_model,
                             prompt_input_ids,
                             prompt_attention_mask,
@@ -773,7 +648,7 @@ class DROVTrainer(BaseTrainer):
                             completion_attention_mask,
                         )
 
-                prompt_keys = self._prompt_keys_from_batch(batch["prompt_input_ids"], batch["prompt_attention_mask"])
+                prompt_keys = self.prompt_keys_from_batch(batch["prompt_input_ids"], batch["prompt_attention_mask"])
                 policy_logps_list = policy_logps.detach().cpu().to(torch.float32).tolist()
                 rewards_list = rewards.detach().cpu().to(torch.float32).tolist()
                 for prompt_key, logp, reward in zip(prompt_keys, policy_logps_list, rewards_list, strict=True):
@@ -818,7 +693,7 @@ class DROVTrainer(BaseTrainer):
             metric_key_prefix=metric_key_prefix,
         )
 
-        policy_reward_metrics = self._compute_policy_reward_metric(
+        policy_reward_metrics = self.compute_policy_reward_metric(
             eval_dataset if isinstance(eval_dataset, (Dataset, IterableDataset)) else None
         )
         if not policy_reward_metrics:
@@ -847,7 +722,7 @@ class DROVTrainer(BaseTrainer):
 
         return super().log(logs, start_time)
 
-    def _save_value_model(self, output_dir: Path) -> None:
+    def save_value_model(self, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         unwrapped_value_model = (
@@ -875,7 +750,7 @@ class DROVTrainer(BaseTrainer):
                 self.deepspeed = backup_deepspeed
 
         save_dir = Path(output_dir) if output_dir is not None else Path(self.args.output_dir)
-        self._save_value_model(save_dir / "value_model")
+        self.save_value_model(save_dir / "value_model")
 
     def _save_checkpoint(self, model, trial) -> None:
         del model
@@ -889,4 +764,4 @@ class DROVTrainer(BaseTrainer):
 
         checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
         output_dir = Path(self.args.output_dir) / checkpoint_folder
-        self._save_value_model(output_dir / "value_model")
+        self.save_value_model(output_dir / "value_model")

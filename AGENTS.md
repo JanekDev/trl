@@ -74,7 +74,7 @@ python examples/scripts/drov.py \
   --eval_fold_index 0 \
   --eval_prompts_per_fold 1000 \
   --tau 1.0 \
-  --policy_learning_rate 1e-4 \
+  --learning_rate 1e-4 \
   --value_learning_rate 1e-4 \
   --max_steps 40000 \
   --warmup_steps 150 \

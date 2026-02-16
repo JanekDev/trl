@@ -5,3 +5,6 @@
     - Splits are a bit vague? 64k in one split. should we just split out 5k prompts from it for eval and then split it into 1k prompts and use that for training?
 5. KTO Baseline in paper is using binarized version of UltraFeedback. Should we use the same?
 6. TRL fork or separate repo where we inherit from TRL classes? - keep here
+
+proxy instead of judge every n steps
+spirman corerlation between 

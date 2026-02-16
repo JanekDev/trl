@@ -62,10 +62,6 @@ class DROVConfig(TrainingArguments):
 
     # DRO-V specific parameters
     tau: float = field(default=1.0, metadata={"help": "DRO-V KL coefficient τ."})
-    policy_learning_rate: float = field(
-        default=1e-4,
-        metadata={"help": "Policy learning rate before applying 1/τ scaling."},
-    )
     value_learning_rate: float = field(
         default=1e-4,
         metadata={"help": "Learning rate for the value model."},
@@ -75,11 +71,11 @@ class DROVConfig(TrainingArguments):
         metadata={"help": "Padding label id for completion tokens."},
     )
     max_prompt_length: int | None = field(
-        default=512,
-        metadata={"help": "Maximum prompt length during tokenization."},
+        default=None,
+        metadata={"help": "Maximum prompt length during tokenization. None means no truncation."},
     )
     max_completion_length: int | None = field(
-        default=512,
+        default=2048,
         metadata={"help": "Maximum completion length during tokenization."},
     )
     disable_dropout: bool = field(

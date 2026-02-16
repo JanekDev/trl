@@ -71,9 +71,11 @@ def _generate_completions(
                 **tokenized_batch,
                 generation_config=generation_config,
             )
+            is_enc_dec = getattr(unwrapped_model.config, "is_encoder_decoder", False)
             for prompt, generation in zip(tokenized_batch.input_ids, generations, strict=True):
-                # Remove prompt from generation
-                generation = generation[len(prompt) :]
+                if not is_enc_dec:
+                    # For decoder-only models, strip the prompt prefix from the output
+                    generation = generation[len(prompt) :]
                 completion = tokenizer.decode(generation, skip_special_tokens=True)
                 completions.append(completion)
     return completions
