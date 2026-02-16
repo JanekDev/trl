@@ -9,7 +9,7 @@ uv run python examples/scripts/drov.py \
     --num_folds 5 --eval_fold_index 0 --prompts_per_fold 5000 \
     --tau 1.0 --learning_rate 1e-4 --value_learning_rate 1e-4 \
     --max_steps 40000 --warmup_steps 150 --per_device_train_batch_size 32 \
-    --optim adafactor --lr_scheduler_type linear
+    --optim adafactor --lr_scheduler_type linear --dtype bfloat16
 
 With judge eval (Gemma 3 27B IT via OpenRouter):
 OPENAI_BASE_URL=https://openrouter.ai/api/v1 OPENAI_API_KEY=<your-key> \
@@ -18,9 +18,9 @@ uv run python examples/scripts/drov.py \
     --model_name_or_path google/flan-t5-large \
     --dataset_revision main \
     --num_folds 5 --eval_fold_index 0 --prompts_per_fold 5000 \
-    --tau 1.0 --learning_rate 1e-4 --value_learning_rate 1e-4 \
+    --tau 1.0 --learning_rate 1e-5 --value_learning_rate 1e-5 \
     --max_steps 40000 --warmup_steps 150 --per_device_train_batch_size 32 \
-    --optim adafactor --lr_scheduler_type linear \
+    --optim adafactor --lr_scheduler_type linear --dtype bfloat16 \
     --eval_steps 2000 \
     --judge_model google/gemma-3-27b-it \
     --judge_num_prompts 50 --judge_max_new_tokens 1024
@@ -30,7 +30,8 @@ uv run python examples/scripts/drov.py \
     --output_dir drov-overfit \
     --model_name_or_path google/flan-t5-large \
     --dataset_revision main \
-    --overfit_one_batch --per_device_train_batch_size 8
+    --overfit_one_batch --per_device_train_batch_size 8 \
+    --optim adafactor --dtype bfloat16
 """
 
 from __future__ import annotations
@@ -218,7 +219,7 @@ def main() -> None:
         training_args.logging_steps = 1
         training_args.eval_strategy = "no"
     else:
-        if str(training_args.eval_strategy) == "no":
+        if training_args.eval_strategy in ("no", "IntervalStrategy.NO") or str(training_args.eval_strategy).endswith("no"):
             training_args.eval_strategy = "steps"
         if training_args.eval_steps is None:
             training_args.eval_steps = training_args.save_steps
