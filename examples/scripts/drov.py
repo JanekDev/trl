@@ -19,8 +19,10 @@ uv run python examples/scripts/drov.py \
     --dataset_revision main \
     --num_folds 5 --eval_fold_index 0 --prompts_per_fold 5000 \
     --tau 1.0 --learning_rate 1e-5 --value_learning_rate 1e-5 \
-    --max_steps 40000 --warmup_steps 150 --per_device_train_batch_size 32 \
+    --max_steps 40000 --warmup_steps 150 \
+    --per_device_train_batch_size 16 --gradient_accumulation_steps 2 \
     --optim adafactor --lr_scheduler_type linear --dtype bfloat16 \
+    --max_prompt_length 512 --max_completion_length 512 \
     --eval_steps 2000 \
     --judge_model google/gemma-3-27b-it \
     --judge_num_prompts 50 --judge_max_new_tokens 1024
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -203,6 +206,8 @@ def prepare_triplet_dataset(sa: ScriptArgs, ta: DROVConfig) -> DatasetDict:
 
 def main() -> None:
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+
+    os.environ.setdefault("WANDB_PROJECT", "drov-ultrafeedback")
 
     parser = HfArgumentParser((ScriptArgs, DROVConfig))
     script_args, training_args = parser.parse_args_into_dataclasses()

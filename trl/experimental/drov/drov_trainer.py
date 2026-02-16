@@ -282,9 +282,11 @@ class DROVTrainer(BaseTrainer):
         completion_input_ids = tokenizer(features["completion"], add_special_tokens=False)["input_ids"]
 
         if tokenizer.eos_token_id is not None:
-            prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
-            if not completion_input_ids or completion_input_ids[-1] != tokenizer.eos_token_id:
-                completion_input_ids = completion_input_ids + [tokenizer.eos_token_id]
+            eos = tokenizer.eos_token_id
+            prompt_input_ids = [t for t in prompt_input_ids if t != eos]
+            completion_input_ids = [t for t in completion_input_ids if t != eos]
+            prompt_input_ids = prompt_input_ids + [eos]
+            completion_input_ids = completion_input_ids + [eos]
 
         if max_prompt_length is not None:
             prompt_input_ids = prompt_input_ids[-max_prompt_length:]
