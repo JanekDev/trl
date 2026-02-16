@@ -144,7 +144,6 @@ nbs/wandb/
 examples/notebooks/wandb/
 wandb/
 AGENTS.md
-setup_runpod.sh
 todo.md
 uv.lock
 dro-paper/algorithm.sty
