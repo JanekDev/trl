@@ -780,7 +780,8 @@ class DROTrainer(BaseTrainer):
                 "loss/policy": self.accelerator.gather_for_metrics(policy_loss.detach()).mean().item(),
                 "loss/value": self.accelerator.gather_for_metrics(value_loss.detach()).mean().item(),
                 "train/log_ratio": self.accelerator.gather_for_metrics(log_ratio).mean().item(),
-                "train/kl_approx": self.accelerator.gather_for_metrics(log_ratio).mean().item(),
+                # Non-negative KL proxy; avoids negative "KL" logs from signed per-sample log-ratios.
+                "train/kl_approx": (0.5 * self.accelerator.gather_for_metrics(log_ratio).pow(2)).mean().item(),
                 "train/values": self.accelerator.gather_for_metrics(values).mean().item(),
                 "train/rewards": self.accelerator.gather_for_metrics(rewards).mean().item(),
                 "train/advantage": self.accelerator.gather_for_metrics(advantage).mean().item(),
