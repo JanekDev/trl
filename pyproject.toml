@@ -33,6 +33,7 @@ dependencies = [
     "datasets>=3.0.0",
     "packaging>20.0",
     "transformers>=4.56.2",
+    "wandb>=0.25.0",
 ]
 dynamic = ["version"]
 
@@ -196,4 +197,9 @@ filterwarnings = [
     # Upstream issue: https://github.com/pytorch/pytorch/issues/174546
     "ignore:The argument 'device' of Tensor.pin_memory:DeprecationWarning",
     "ignore:The argument 'device' of Tensor.is_pinned:DeprecationWarning",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
 ]
