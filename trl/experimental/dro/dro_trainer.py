@@ -859,6 +859,9 @@ class DROTrainer(BaseTrainer):
         - End-of-training summary: ``"train_loss"`` key present → also flush train metrics so they
           appear in ``log_history`` even when ``logging_steps > max_steps``.
         - Eval log: ``"eval_loss"`` key present → flush ``_stored_metrics["eval"]``.
+
+        For each custom metric we log two explicit statistics over the current logging window:
+        ``<metric>_mean`` and ``<metric>_std``.
         """
         if "loss" in logs or ("train_loss" in logs and "train" in self._stored_metrics):
             train_eval = "train"
@@ -867,7 +870,9 @@ class DROTrainer(BaseTrainer):
         prefix = "eval_" if train_eval == "eval" else ""
         if train_eval in self._stored_metrics:
             for key, values in self._stored_metrics[train_eval].items():
-                logs[f"{prefix}{key}"] = torch.tensor(values, dtype=torch.float32).mean().item()
+                values_t = torch.tensor(values, dtype=torch.float32)
+                logs[f"{prefix}{key}_mean"] = values_t.mean().item()
+                logs[f"{prefix}{key}_std"] = values_t.std(unbiased=False).item()
             del self._stored_metrics[train_eval]
         return super().log(logs, start_time)
 
