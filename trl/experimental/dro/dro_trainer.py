@@ -788,33 +788,25 @@ class DROTrainer(BaseTrainer):
                     )
             log_pi_ref = self._get_batch_logps(ref_out.logits, batch["completion_labels"])
 
-        # ── Step 3: Log-ratio log(π_θ / π_ref) ───────────────────────────
-        log_ratio = log_pi - log_pi_ref  # (B,); positive = policy more likely than ref
+        # log-ratio
+        log_ratio = log_pi - log_pi_ref
 
-        # ── Step 4: Value estimate V_φ(x)  — prompt only ─────────────────
+        # value estimate
         values = value_out.logits.squeeze(-1)  # (B, 1) → (B,)
 
-        # ── Step 5: Rewards (already z-normalised when normalize_rewards=True)
+        # rewards
         rewards = batch["reward"]  # (B,)
 
-        # ── Step 6: Policy loss  (∇_θ, Algorithm 1) ──────────────────────
-        # advantage = r − V(x); detached so policy gradient does not flow into V params
-        advantage = (rewards - values).detach()
-        policy_loss = (-log_pi * advantage + 0.5 * self.tau * log_ratio.pow(2)).mean()
+        advantage = rewards - values
 
-        # ── Step 7: Value loss  (∇_φ, Algorithm 1) ───────────────────────
-        # target = r − τ·log_ratio; detached so value gradient does not flow into π params
-        value_target = (rewards - self.tau * log_ratio).detach()
-        value_loss = 0.5 * (values - value_target).pow(2).mean()
+        # correct implementastion, let's ignore Tau separate tau scaling for policy, because we optimize with Adam
+        loss = (advantage - self.tau * log_ratio).pow(2).mean()
 
-        # ── Step 8: Combined loss ─────────────────────────────────────────
-        loss = policy_loss + value_loss
 
         # ── Step 9: Diagnostics ───────────────────────────────────────────
         with torch.no_grad():
             metrics = {
-                "loss/policy": self.accelerator.gather_for_metrics(policy_loss.detach()).mean().item(),
-                "loss/value": self.accelerator.gather_for_metrics(value_loss.detach()).mean().item(),
+                "loss/dro": self.accelerator.gather_for_metrics(loss.detach()).mean().item(),
                 "train/log_ratio": self.accelerator.gather_for_metrics(log_ratio).mean().item(),
                 # Non-negative KL proxy; avoids negative "KL" logs from signed per-sample log-ratios.
                 "train/kl_approx": (0.5 * self.accelerator.gather_for_metrics(log_ratio).pow(2)).mean().item(),
