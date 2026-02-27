@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import re
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -417,27 +418,34 @@ class OpenAIPairwiseJudge(BasePairwiseJudge):
         self.double_judge = double_judge
         self.num_requests = 0
         self._warned = False
+        self.error_rank = -100
 
     def _get_rank(self, prompt: str, candidates: list[str]) -> int:
         content = self.system_prompt.format(prompt=prompt, response0=candidates[0], response1=candidates[1])
         messages = [{"role": "user", "content": content}]
-        completion = self.client.chat.completions.create(model=self.model, messages=messages, max_tokens=1)
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=4,
+            temperature=0,
+        )
         response = completion.choices[0].message.content
-        if response in ["0", "1"]:
-            return int(response)
-        logging.debug(f"Invalid response from the judge model: '{response}'. Returning -1.")
-        return -1
+        match = re.search(r"[01]", (response or "").strip())
+        if match:
+            return int(match.group(0))
+        logging.debug(f"Invalid response from the judge model: '{response}'. Returning {self.error_rank}.")
+        return self.error_rank
 
     def judge(self, prompts: list[str], completions: list[list[str]], shuffle_order: bool = True) -> list[int]:
         # Check if the limit of requests is reached, if so, use random choice instead
         if self.max_requests is not None and self.num_requests >= self.max_requests:
             if not self._warned:  # Print the warning only once
                 logging.warning(
-                    f"Reached the maximum number of requests ({self.max_requests}). From now on, returning -1 instead. "
+                    f"Reached the maximum number of requests ({self.max_requests}). From now on, returning {self.error_rank} instead. "
                     " To increase the limit, set `max_requests` to a higher value, or to `None` for no limit."
                 )
                 self._warned = True
-            return [-1] * len(prompts)
+            return [self.error_rank] * len(prompts)
 
         if self.double_judge:
             # Per-sample position-bias mitigation: judge both orderings concurrently.
@@ -445,8 +453,8 @@ class OpenAIPairwiseJudge(BasePairwiseJudge):
             def judge_both(prompt, pair):
                 j1 = self._get_rank(prompt, pair)           # order: (ref, policy)
                 j2 = self._get_rank(prompt, pair[::-1])     # order: (policy, ref)
-                if j1 == -1 or j2 == -1:
-                    return -1
+                if j1 == self.error_rank or j2 == self.error_rank:
+                    return self.error_rank
                 return 1 if (j1 == 1 and j2 == 0) else 0
 
             with concurrent.futures.ThreadPoolExecutor() as executor:
