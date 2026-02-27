@@ -364,7 +364,7 @@ class HfPairwiseJudge(BasePairwiseJudge):
 
 class OpenAIPairwiseJudge(BasePairwiseJudge):
     """
-    Judge based on the OpenAI API.
+    Judge based on the OpenAI API (or any OpenAI-compatible endpoint such as OpenRouter).
 
     This judge is relevant for assessing the quality chat models, where the completion is a response to a given prompt.
 
@@ -378,21 +378,55 @@ class OpenAIPairwiseJudge(BasePairwiseJudge):
             response.
         max_requests (`int` or `None`, *optional*, defaults to `1000`):
             Maximum number of requests to make to the OpenAI API. If set to `None`, there is no limit.
+        base_url (`str`, *optional*):
+            Custom base URL for the OpenAI client. Useful for OpenAI-compatible providers such as OpenRouter
+            (e.g. ``"https://openrouter.ai/api/v1"``). If ``None``, the standard ``OPENAI_BASE_URL`` env var or
+            the OpenAI default is used.
+        api_key (`str`, *optional*):
+            API key for the client. Overrides the ``OPENAI_API_KEY`` environment variable when provided.
+        double_judge (`bool`, *optional*, defaults to `False`):
+            When ``True``, each pair is judged **twice** — once in the original order and once with the two
+            completions swapped — to mitigate per-sample position bias.  A win for the second completion is
+            counted only when *both* orderings agree; disagreements (position-bias artefacts) are treated as
+            ties and counted as ``0``.  When ``False``, the behaviour is controlled by ``shuffle_order`` in
+            :meth:`judge` (population-level bias mitigation via random shuffling).
     """
 
     def __init__(
-        self, model="gpt-4-turbo-preview", system_prompt: str | None = None, max_requests: int | None = 1_000
+        self,
+        model="gpt-4-turbo-preview",
+        system_prompt: str | None = None,
+        max_requests: int | None = 1_000,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        double_judge: bool = False,
     ):
         if not is_openai_available():
             raise ValueError("OpenAI client is not installed. Please install it with 'pip install openai'.")
         from openai import OpenAI
 
-        self.client = OpenAI()
+        client_kwargs = {}
+        if base_url is not None:
+            client_kwargs["base_url"] = base_url
+        if api_key is not None:
+            client_kwargs["api_key"] = api_key
+        self.client = OpenAI(**client_kwargs)
         self.model = model
         self.system_prompt = system_prompt or DEFAULT_PAIRWISE_SYSTEM_PROMPT
         self.max_requests = max_requests
+        self.double_judge = double_judge
         self.num_requests = 0
         self._warned = False
+
+    def _get_rank(self, prompt: str, candidates: list[str]) -> int:
+        content = self.system_prompt.format(prompt=prompt, response0=candidates[0], response1=candidates[1])
+        messages = [{"role": "user", "content": content}]
+        completion = self.client.chat.completions.create(model=self.model, messages=messages, max_tokens=1)
+        response = completion.choices[0].message.content
+        if response in ["0", "1"]:
+            return int(response)
+        logging.debug(f"Invalid response from the judge model: '{response}'. Returning -1.")
+        return -1
 
     def judge(self, prompts: list[str], completions: list[list[str]], shuffle_order: bool = True) -> list[int]:
         # Check if the limit of requests is reached, if so, use random choice instead
@@ -405,35 +439,36 @@ class OpenAIPairwiseJudge(BasePairwiseJudge):
                 self._warned = True
             return [-1] * len(prompts)
 
-        # Shuffle the order of the completions to avoid positional bias
-        if shuffle_order:
-            flip_mask = np.random.choice([True, False], size=len(prompts))
-            completions = [pair[::-1] if flip else pair for flip, pair in zip(flip_mask, completions, strict=True)]
+        if self.double_judge:
+            # Per-sample position-bias mitigation: judge both orderings concurrently.
+            # Policy (idx 1) wins only when both orderings agree; otherwise treated as a tie (0).
+            def judge_both(prompt, pair):
+                j1 = self._get_rank(prompt, pair)           # order: (ref, policy)
+                j2 = self._get_rank(prompt, pair[::-1])     # order: (policy, ref)
+                if j1 == -1 or j2 == -1:
+                    return -1
+                return 1 if (j1 == 1 and j2 == 0) else 0
 
-        # Define a function to get the rank for a single prompt, will be called concurrently
-        def get_rank(prompt, candidates):
-            content = self.system_prompt.format(prompt=prompt, response0=candidates[0], response1=candidates[1])
-            messages = [{"role": "user", "content": content}]
-            completion = self.client.chat.completions.create(model=self.model, messages=messages, max_tokens=1)
-            response = completion.choices[0].message.content
-            if response in ["0", "1"]:
-                return int(response)
-            else:
-                logging.debug(f"Invalid response from the judge model: '{response}'. Returning -1.")
-                return -1
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                ranks = list(executor.map(judge_both, prompts, completions))
+            # Each pair required 2 API calls
+            self.num_requests += 2 * len(prompts)
+        else:
+            # Population-level bias mitigation via random shuffle
+            if shuffle_order:
+                flip_mask = np.random.choice([True, False], size=len(prompts))
+                completions = [
+                    pair[::-1] if flip else pair for flip, pair in zip(flip_mask, completions, strict=True)
+                ]
 
-        # Call the completions concurrently
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            ranks = list(executor.map(get_rank, prompts, completions))
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                ranks = list(executor.map(self._get_rank, prompts, completions))
 
-        # Flip back the ranks to the original order if needed
-        if shuffle_order:
-            ranks = [ranks[i] if not flip else 1 - ranks[i] for i, flip in enumerate(flip_mask)]
+            if shuffle_order:
+                ranks = [ranks[i] if not flip else 1 - ranks[i] for i, flip in enumerate(flip_mask)]
 
-        # Update the number of requests
-        self.num_requests += len(prompts)
+            self.num_requests += len(prompts)
 
-        # Return the ranks
         return ranks
 
 

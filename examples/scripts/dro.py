@@ -89,6 +89,8 @@ accelerate launch --num_processes 4 examples/scripts/dro.py \\
 """
 
 import os
+import signal
+import sys
 from dataclasses import dataclass, field
 
 from datasets import Dataset, load_dataset
@@ -96,6 +98,8 @@ from transformers import AutoModelForCausalLM, AutoModelForSequenceClassificatio
 
 from trl import ModelConfig, ScriptArguments, get_peft_config
 from trl.experimental.dro import DROConfig, DROTrainer
+from trl.experimental.judges import OpenAIPairwiseJudge
+from trl.experimental.winrate_callback import WinRateCallback
 
 
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
@@ -128,6 +132,10 @@ class DROScriptArguments(ScriptArguments):
     max_samples: int | None = field(
         default=None,
         metadata={"help": "Truncate each split to this many examples after flattening (useful for smoke-tests)."},
+    )
+    win_rate_num_prompts: int = field(
+        default=256,
+        metadata={"help": "Number of prompts from the eval split used for win-rate evaluation."},
     )
 
 
@@ -209,18 +217,21 @@ if __name__ == "__main__":
         name=script_args.dataset_config,
         split=script_args.dataset_train_split,
     )
-    train_dataset = make_dro_dataset(
-        raw_train,
-        max_samples=script_args.max_samples,
-        num_proc=training_args.dataset_num_proc,
-    )
+    full_dataset = make_dro_dataset(raw_train, num_proc=training_args.dataset_num_proc)
 
     eval_dataset = None
     if training_args.eval_strategy != "no":
-        # UltraFeedback has no official test split; carve 5 % off the training data
-        split = train_dataset.train_test_split(test_size=0.05, seed=42)
+        # Carve eval from the *full* dataset before capping training samples so
+        # that win-rate evaluation has enough prompts regardless of max_samples.
+        split = full_dataset.train_test_split(test_size=0.05, seed=42)
         train_dataset = split["train"]
         eval_dataset = split["test"]
+    else:
+        train_dataset = full_dataset
+
+    # Apply training-sample cap after the eval split so the eval pool stays large.
+    if script_args.max_samples is not None:
+        train_dataset = train_dataset.select(range(min(script_args.max_samples, len(train_dataset))))
 
     # ── Train ─────────────────────────────────────────────────────────────────
     trainer = DROTrainer(
@@ -233,9 +244,30 @@ if __name__ == "__main__":
         peft_config=get_peft_config(model_args),
     )
 
+    # ── Win-rate evaluation via Gemma-3-27B judge (OpenRouter) ────────────────
+    # Compares the trained policy against the reference/starting model every
+    # eval step.  Position bias is cancelled by judging each pair twice (both
+    # orderings) via double_judge=True; a win is counted only when both agree.
+    if eval_dataset is not None:
+        judge = OpenAIPairwiseJudge(
+            model="google/gemma-3-27b-it",
+            base_url="https://openrouter.ai/api/v1",
+            double_judge=True,
+        )
+        win_rate_callback = WinRateCallback(judge=judge, trainer=trainer, num_prompts=script_args.win_rate_num_prompts)
+        trainer.add_callback(win_rate_callback)
+
+    def _save_and_push(signum, frame):
+        print(f"\nCaught signal {signum}, saving and pushing model before exit...")
+        trainer.save_model(training_args.output_dir)
+        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _save_and_push)
+    signal.signal(signal.SIGTERM, _save_and_push)
+
     trainer.train()
 
     # ── Save ──────────────────────────────────────────────────────────────────
     trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+    trainer.push_to_hub(dataset_name=script_args.dataset_name)
