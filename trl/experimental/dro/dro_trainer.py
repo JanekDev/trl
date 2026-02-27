@@ -349,7 +349,8 @@ class DROTrainer(BaseTrainer):
                 \bigl(r - V_\phi(x) - \tau \log\tfrac{\pi_\theta(y|x)}{\pi_\text{ref}(y|x)}\bigr)^2
             \right]
 
-    The policy and value model receive independent gradient signals (via ``detach()``).
+    The policy and value model receive independent gradient signals naturally through autograd,
+    since they are separate modules with no shared parameters.
 
     Args:
         model ([`~transformers.PreTrainedModel`] or `str`):
@@ -750,9 +751,9 @@ class DROTrainer(BaseTrainer):
         1. Forward policy + value through the wrapper (single DDP call).
         2. Compute reference log-probs (cached or live).
         3. Compute log-ratio log(π_θ / π_ref).
-        4. Policy loss: –log π · advantage + τ/2 · log_ratio².
-        5. Value loss: ½ (V – target)² where target = r – τ·log_ratio.
-        6. Combined loss = policy_loss + value_loss.
+        4. Compute the unified quadratic loss: (r − V_φ − τ·log_ratio)².
+           Autograd separates the gradients: policy params see the log_ratio term,
+           value params see the V_φ term — no explicit detach() required.
         """
         device = self.accelerator.device
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -799,11 +800,12 @@ class DROTrainer(BaseTrainer):
 
         advantage = rewards - values
 
-        # correct implementastion, let's ignore Tau separate tau scaling for policy, because we optimize with Adam
+        # Unified quadratic loss from the paper (§3.3, Algorithm 1).
+        # Gradient w.r.t. policy params θ: -2τ·(r−V−τ·log_ratio)·∇_θ log π_θ
+        # Gradient w.r.t. value params φ:  +2·(r−V−τ·log_ratio)·∇_φ V_φ
         loss = (advantage - self.tau * log_ratio).pow(2).mean()
 
-
-        # ── Step 9: Diagnostics ───────────────────────────────────────────
+        # ── Diagnostics ───────────────────────────────────────────────────
         with torch.no_grad():
             metrics = {
                 "loss/dro": self.accelerator.gather_for_metrics(loss.detach()).mean().item(),
