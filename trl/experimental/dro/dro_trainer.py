@@ -500,7 +500,10 @@ class DROTrainer(BaseTrainer):
                             module.to(torch.bfloat16)
                 self._peft_has_been_casted_to_bf16 = True
 
-            # Apply the same PEFT config to the value model
+            # Apply the same PEFT config to the value model (SEQ_CLS task type)
+            value_peft_config = copy.copy(peft_config)
+            value_peft_config.task_type = peft.TaskType.SEQ_CLS
+
             if getattr(value_model, "is_loaded_in_8bit", False) or getattr(value_model, "is_loaded_in_4bit", False):
                 value_model = peft.prepare_model_for_kbit_training(
                     value_model, use_gradient_checkpointing=args.gradient_checkpointing
@@ -515,7 +518,7 @@ class DROTrainer(BaseTrainer):
 
                     value_model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-            value_model = peft.get_peft_model(value_model, peft_config)
+            value_model = peft.get_peft_model(value_model, value_peft_config)
 
             if args.bf16 and getattr(value_model, "is_loaded_in_4bit", False):
                 for name, module in value_model.named_modules():
