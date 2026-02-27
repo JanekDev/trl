@@ -5943,6 +5943,7 @@ dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
     { name = "packaging" },
+    { name = "pytest" },
     { name = "transformers" },
     { name = "wandb" },
 ]
@@ -6064,6 +6065,7 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pre-commit", marker = "extra == 'quality'" },
     { name = "pydantic", marker = "extra == 'vllm'" },
+    { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
