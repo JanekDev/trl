@@ -750,7 +750,7 @@ class DROTrainer(BaseTrainer):
         1. Forward policy + value through the wrapper (single DDP call).
         2. Compute reference log-probs (cached or live).
         3. Compute log-ratio log(π_θ / π_ref).
-        4. Policy loss: –log π · advantage + ½ log_ratio² (rescaled by 1/τ).
+        4. Policy loss: –log π · advantage + τ/2 · log_ratio².
         5. Value loss: ½ (V – target)² where target = r – τ·log_ratio.
         6. Combined loss = policy_loss + value_loss.
         """
