@@ -94,7 +94,13 @@ import sys
 from dataclasses import dataclass, field
 
 from datasets import Dataset, load_dataset
-from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, HfArgumentParser
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    GenerationConfig,
+    HfArgumentParser,
+)
 
 from trl import ModelConfig, ScriptArguments, get_peft_config
 from trl.experimental.dro import DROConfig, DROTrainer
@@ -103,6 +109,16 @@ from trl.experimental.winrate_callback import WinRateCallback
 
 
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
+
+# Hardcoded generation settings for win-rate callback evaluations.
+WIN_RATE_GENERATION_CONFIG = GenerationConfig(
+    max_new_tokens=256,
+    do_sample=True,
+    temperature=0.9,
+    top_p=1.0,
+    top_k=0,
+    repetition_penalty=1.0,
+)
 
 
 # ── Extra script arguments ────────────────────────────────────────────────────
@@ -254,7 +270,12 @@ if __name__ == "__main__":
             base_url="https://openrouter.ai/api/v1",
             double_judge=True,
         )
-        win_rate_callback = WinRateCallback(judge=judge, trainer=trainer, num_prompts=script_args.win_rate_num_prompts)
+        win_rate_callback = WinRateCallback(
+            judge=judge,
+            trainer=trainer,
+            generation_config=WIN_RATE_GENERATION_CONFIG,
+            num_prompts=script_args.win_rate_num_prompts,
+        )
         trainer.add_callback(win_rate_callback)
 
     def _save_and_push(signum, frame):

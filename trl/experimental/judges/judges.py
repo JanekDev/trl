@@ -376,7 +376,7 @@ class OpenAIPairwiseJudge(BasePairwiseJudge):
             prompt should contain the following placeholders: `{prompt}`, `{response0}`, and `{response1}`. Also, the
             inference is called with `max_tokens=1`, consequently the system prompt should ask for a single token
             response.
-        max_requests (`int` or `None`, *optional*, defaults to `1000`):
+        max_requests (`int` or `None`, *optional*, defaults to `None`):
             Maximum number of requests to make to the OpenAI API. If set to `None`, there is no limit.
         base_url (`str`, *optional*):
             Custom base URL for the OpenAI client. Useful for OpenAI-compatible providers such as OpenRouter
@@ -396,7 +396,7 @@ class OpenAIPairwiseJudge(BasePairwiseJudge):
         self,
         model="gpt-4-turbo-preview",
         system_prompt: str | None = None,
-        max_requests: int | None = 1_000,
+        max_requests: int | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         double_judge: bool = False,
