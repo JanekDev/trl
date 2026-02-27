@@ -460,7 +460,7 @@ class DROTrainer(BaseTrainer):
                 "policy and value model is detrimental per DRO paper §4. Pass separate model instances."
             )
 
-        # ── 4. Apply PEFT to policy only ───────────────────────────────────
+        # ── 4. Apply PEFT to policy and value model ────────────────────────
         self._peft_has_been_casted_to_bf16 = False
 
         if peft_config is not None:
@@ -500,7 +500,33 @@ class DROTrainer(BaseTrainer):
                             module.to(torch.bfloat16)
                 self._peft_has_been_casted_to_bf16 = True
 
+            # Apply the same PEFT config to the value model
+            if getattr(value_model, "is_loaded_in_8bit", False) or getattr(value_model, "is_loaded_in_4bit", False):
+                value_model = peft.prepare_model_for_kbit_training(
+                    value_model, use_gradient_checkpointing=args.gradient_checkpointing
+                )
+            elif args.gradient_checkpointing:
+                if hasattr(value_model, "enable_input_require_grads"):
+                    value_model.enable_input_require_grads()
+                else:
+
+                    def make_inputs_require_grad(module, input, output):
+                        output.requires_grad_(True)
+
+                    value_model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+            value_model = peft.get_peft_model(value_model, peft_config)
+
+            if args.bf16 and getattr(value_model, "is_loaded_in_4bit", False):
+                for name, module in value_model.named_modules():
+                    if "norm" in name:
+                        module.to(torch.float32)
+                    elif any(x in name for x in ["score", "classifier", "embed_tokens", "embed_in", "embed_out"]):
+                        if hasattr(module, "weight") and module.weight.dtype == torch.float32:
+                            module.to(torch.bfloat16)
+
         self.is_peft_model = is_peft_available() and isinstance(model, peft.PeftModel)
+        self.is_value_peft_model = is_peft_available() and isinstance(value_model, peft.PeftModel)
 
         # ── 5. Set up reference model ──────────────────────────────────────
         if ref_model is not None:
@@ -953,7 +979,7 @@ class DROTrainer(BaseTrainer):
         if self.is_deepspeed_enabled:
             self.deepspeed = backup_deepspeed
 
-        # Save value model alongside the policy
+        # Save value model alongside the policy (adapter-only if PEFT was applied)
         value_dir = os.path.join(output_dir or self.args.output_dir, "value_model")
         self.accelerator.unwrap_model(backup).value_model.save_pretrained(value_dir)
 
