@@ -114,10 +114,10 @@ os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 WIN_RATE_GENERATION_CONFIG = GenerationConfig(
     max_new_tokens=512,
     do_sample=True,
-    temperature=0.9,
-    top_p=1.0,
-    top_k=0,
-    repetition_penalty=1.0,
+    temperature=0.7,
+    top_p=0.8,
+    top_k=20,
+    repetition_penalty=1.1,
 )
 
 
