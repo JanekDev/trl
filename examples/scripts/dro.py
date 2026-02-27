@@ -285,9 +285,10 @@ if __name__ == "__main__":
         trainer.add_callback(win_rate_callback)
 
     def _save_and_push(signum, frame):
-        print(f"\nCaught signal {signum}, saving and pushing model before exit...")
-        trainer.save_model(training_args.output_dir)
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+        if trainer.accelerator.is_main_process:
+            print(f"\nCaught signal {signum}, saving and pushing model before exit...")
+            trainer.save_model(training_args.output_dir)
+            trainer.push_to_hub(dataset_name=script_args.dataset_name)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _save_and_push)

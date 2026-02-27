@@ -182,15 +182,17 @@ class WinRateCallback(TrainerCallback):
             )
             # Compute initial win rate as a reference point
             completions = list(zip(self.ref_completions, self.ref_completions, strict=True))
-            if self.use_soft_judge:
-                ref_win_probs = self.judge.judge(prompts, completions, self.shuffle_order, return_scores=True)
-                winner_indices = [0 if score > 0.5 else 1 for score in ref_win_probs]
-                ref_win_probs = gather_object(ref_win_probs)
-            else:
-                winner_indices = self.judge.judge(prompts, completions, self.shuffle_order)
             prompts = gather_object(prompts)
             completions = gather_object(completions)
-            winner_indices = gather_object(winner_indices)
+            if accelerator.is_main_process:
+                if self.use_soft_judge:
+                    ref_win_probs = self.judge.judge(prompts, completions, self.shuffle_order, return_scores=True)
+                    winner_indices = [0 if score > 0.5 else 1 for score in ref_win_probs]
+                else:
+                    winner_indices = self.judge.judge(prompts, completions, self.shuffle_order)
+            else:
+                winner_indices = []
+                ref_win_probs = []
 
         # Logging
         if self.trainer.accelerator.is_main_process:
@@ -242,16 +244,17 @@ class WinRateCallback(TrainerCallback):
             )
 
             completions = list(zip(self.ref_completions, completions, strict=True))
-
-            if self.use_soft_judge:
-                ref_win_probs = self.judge.judge(prompts, completions, self.shuffle_order, return_scores=True)
-                winner_indices = [0 if score > 0.5 else 1 for score in ref_win_probs]
-                ref_win_probs = gather_object(ref_win_probs)
-            else:
-                winner_indices = self.judge.judge(prompts, completions, self.shuffle_order)
             prompts = gather_object(prompts)
             completions = gather_object(completions)
-            winner_indices = gather_object(winner_indices)
+            if accelerator.is_main_process:
+                if self.use_soft_judge:
+                    ref_win_probs = self.judge.judge(prompts, completions, self.shuffle_order, return_scores=True)
+                    winner_indices = [0 if score > 0.5 else 1 for score in ref_win_probs]
+                else:
+                    winner_indices = self.judge.judge(prompts, completions, self.shuffle_order)
+            else:
+                winner_indices = []
+                ref_win_probs = []
 
         # Logging
         if self.trainer.accelerator.is_main_process:
