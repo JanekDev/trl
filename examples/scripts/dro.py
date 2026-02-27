@@ -221,9 +221,9 @@ if __name__ == "__main__":
 
     eval_dataset = None
     if training_args.eval_strategy != "no":
-        # Carve eval from the *full* dataset before capping training samples so
+        # Carve a fixed-size eval split before capping training samples so
         # that win-rate evaluation has enough prompts regardless of max_samples.
-        split = full_dataset.train_test_split(test_size=0.05, seed=42)
+        split = full_dataset.train_test_split(test_size=512, seed=42)
         train_dataset = split["train"]
         eval_dataset = split["test"]
     else:
