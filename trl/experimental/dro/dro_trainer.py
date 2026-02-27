@@ -287,6 +287,13 @@ class PolicyValueWrapper(nn.Module):
         self.config = policy.config
         self.is_gradient_checkpointing = getattr(policy, "is_gradient_checkpointing", False)
 
+    @property
+    def device(self):
+        return next(self.policy.parameters()).device
+
+    def generate(self, *args, **kwargs):
+        return self.policy.generate(*args, **kwargs)
+
     def forward(
         self,
         policy_input_ids: torch.Tensor,
