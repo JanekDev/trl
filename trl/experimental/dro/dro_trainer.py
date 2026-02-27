@@ -800,7 +800,7 @@ class DROTrainer(BaseTrainer):
         # ── Step 6: Policy loss  (∇_θ, Algorithm 1) ──────────────────────
         # advantage = r − V(x); detached so policy gradient does not flow into V params
         advantage = (rewards - values).detach()
-        policy_loss = (-log_pi * advantage + 0.5 * log_ratio.pow(2)).mean() / self.tau
+        policy_loss = (-log_pi * advantage + 0.5 * self.tau * log_ratio.pow(2)).mean()
 
         # ── Step 7: Value loss  (∇_φ, Algorithm 1) ───────────────────────
         # target = r − τ·log_ratio; detached so value gradient does not flow into π params
