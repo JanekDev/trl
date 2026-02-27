@@ -91,6 +91,8 @@ accelerate launch --num_processes 4 examples/scripts/dro.py \\
 import os
 import signal
 import sys
+
+import torch
 from dataclasses import dataclass, field
 
 from datasets import Dataset, load_dataset
@@ -209,9 +211,12 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    torch_dtype = model_args.dtype if model_args.dtype == "auto" else getattr(torch, model_args.dtype)
+
     # ── Load policy (CausalLM) ────────────────────────────────────────────────
     policy = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
+        torch_dtype=torch_dtype,
         trust_remote_code=model_args.trust_remote_code,
         **({} if training_args.model_init_kwargs is None else training_args.model_init_kwargs),
     )
@@ -220,6 +225,7 @@ if __name__ == "__main__":
     value_model = AutoModelForSequenceClassification.from_pretrained(
         value_model_path,
         num_labels=1,
+        torch_dtype=torch_dtype,
         trust_remote_code=model_args.trust_remote_code,
         **({} if training_args.value_model_init_kwargs is None else training_args.value_model_init_kwargs),
     )
