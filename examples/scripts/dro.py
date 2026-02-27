@@ -112,7 +112,7 @@ os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 # Hardcoded generation settings for win-rate callback evaluations.
 WIN_RATE_GENERATION_CONFIG = GenerationConfig(
-    max_new_tokens=256,
+    max_new_tokens=512,
     do_sample=True,
     temperature=0.9,
     top_p=1.0,
