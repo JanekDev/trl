@@ -152,7 +152,14 @@ def _process_tokens(
     # Effective budget for prompt + answer tokens (after BOS/EOS are added)
     effective_max = max_length - (1 if needs_bos else 0) - (1 if needs_eos else 0)
 
-    # Truncate answer from right if the sequence is too long
+    # If the prompt alone is too long, keep its end and drop the answer.
+    # This enforces max_length for the policy path as well.
+    if len(prompt_ids) > effective_max:
+        prompt_ids = prompt_ids[-effective_max:]
+        prompt_mask = prompt_mask[-effective_max:]
+        answer_ids = []
+        answer_mask = []
+    # Otherwise truncate answer from the right when prompt+answer is too long.
     if len(prompt_ids) + len(answer_ids) > effective_max:
         max_answer_len = effective_max - len(prompt_ids)
         if max_answer_len > 0:
