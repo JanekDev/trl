@@ -9,8 +9,8 @@ uv run python examples/scripts/dro.py \
   --hub_model_id MWilinski/dro-v-qwen3-1.7b-paperlike \
   --output_dir /tmp/dro-v-qwen3-1.7b-paperlike \
   --max_steps 40000 \
-  --per_device_train_batch_size 16 \
-  --gradient_accumulation_steps 2 \
+  --per_device_train_batch_size 8 \
+  --gradient_accumulation_steps 4 \
   --val_size 2000 \
   --test_size 2000 \
   --split_seed 42 \
