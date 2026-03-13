@@ -182,8 +182,6 @@ class WinRateCallback(TrainerCallback):
             )
             # Compute initial win rate as a reference point
             completions = list(zip(self.ref_completions, self.ref_completions, strict=True))
-            prompts = gather_object(prompts)
-            completions = gather_object(completions)
             if accelerator.is_main_process:
                 if self.use_soft_judge:
                     ref_win_probs = self.judge.judge(prompts, completions, self.shuffle_order, return_scores=True)
@@ -193,6 +191,9 @@ class WinRateCallback(TrainerCallback):
             else:
                 winner_indices = []
                 ref_win_probs = []
+            prompts = gather_object(prompts)
+            completions = gather_object(completions)
+            winner_indices = gather_object(winner_indices)
 
         # Logging
         if self.trainer.accelerator.is_main_process:
@@ -244,8 +245,6 @@ class WinRateCallback(TrainerCallback):
             )
 
             completions = list(zip(self.ref_completions, completions, strict=True))
-            prompts = gather_object(prompts)
-            completions = gather_object(completions)
             if accelerator.is_main_process:
                 if self.use_soft_judge:
                     ref_win_probs = self.judge.judge(prompts, completions, self.shuffle_order, return_scores=True)
@@ -255,6 +254,9 @@ class WinRateCallback(TrainerCallback):
             else:
                 winner_indices = []
                 ref_win_probs = []
+            prompts = gather_object(prompts)
+            completions = gather_object(completions)
+            winner_indices = gather_object(winner_indices)
 
         # Logging
         if self.trainer.accelerator.is_main_process:

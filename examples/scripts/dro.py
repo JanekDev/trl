@@ -88,11 +88,14 @@ accelerate launch --num_processes 4 examples/scripts/dro.py \\
     --report_to wandb
 """
 
+import json
 import os
+import random
 import signal
 import sys
 
 import torch
+from accelerate import PartialState
 from dataclasses import dataclass, field
 
 from datasets import Dataset, load_dataset
@@ -155,6 +158,18 @@ class DROScriptArguments(ScriptArguments):
         default=256,
         metadata={"help": "Number of prompts from the eval split used for win-rate evaluation."},
     )
+    val_size: int = field(
+        default=2000,
+        metadata={"help": "Number of unique prompts reserved for validation / checkpoint selection."},
+    )
+    test_size: int = field(
+        default=2000,
+        metadata={"help": "Number of unique prompts reserved for the final offline test set."},
+    )
+    split_seed: int = field(
+        default=42,
+        metadata={"help": "Random seed used for deterministic prompt-level train/val/test splitting."},
+    )
 
 
 # ── Dataset helpers ───────────────────────────────────────────────────────────
@@ -194,12 +209,65 @@ def make_dro_dataset(raw: Dataset, max_samples: int | None = None, num_proc: int
     return ds
 
 
+def split_dataset_by_prompt(ds: Dataset, val_size: int, test_size: int, seed: int) -> tuple[Dataset, Dataset, Dataset, dict]:
+    """Split a flattened dataset by unique prompt so no prompt appears in multiple splits."""
+    all_prompts = ds["prompt"]
+    unique_prompts = list(dict.fromkeys(all_prompts))
+    shuffled_prompts = unique_prompts[:]
+    random.Random(seed).shuffle(shuffled_prompts)
+
+    val_prompts = shuffled_prompts[:val_size]
+    test_prompts = shuffled_prompts[val_size : val_size + test_size]
+    train_prompts = shuffled_prompts[val_size + test_size :]
+
+    val_prompt_set = set(val_prompts)
+    test_prompt_set = set(test_prompts)
+
+    train_indices = []
+    val_indices = []
+    test_indices = []
+    for idx, prompt in enumerate(all_prompts):
+        if prompt in val_prompt_set:
+            val_indices.append(idx)
+        elif prompt in test_prompt_set:
+            test_indices.append(idx)
+        else:
+            train_indices.append(idx)
+
+    manifests = {
+        "train_prompts": train_prompts,
+        "val_prompts": val_prompts,
+        "test_prompts": test_prompts,
+        "num_unique_prompts": len(unique_prompts),
+    }
+    return ds.select(train_indices), ds.select(val_indices), ds.select(test_indices), manifests
+
+
+def save_split_artifacts(output_dir: str, manifests: dict, metadata: dict, val_dataset: Dataset, test_dataset: Dataset) -> None:
+    """Persist prompt manifests and held-out datasets for later offline evaluation."""
+    splits_dir = os.path.join(output_dir, "splits")
+    os.makedirs(splits_dir, exist_ok=True)
+
+    with open(os.path.join(splits_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(splits_dir, "train_prompts.json"), "w", encoding="utf-8") as f:
+        json.dump(manifests["train_prompts"], f, indent=2, ensure_ascii=False)
+    with open(os.path.join(splits_dir, "val_prompts.json"), "w", encoding="utf-8") as f:
+        json.dump(manifests["val_prompts"], f, indent=2, ensure_ascii=False)
+    with open(os.path.join(splits_dir, "test_prompts.json"), "w", encoding="utf-8") as f:
+        json.dump(manifests["test_prompts"], f, indent=2, ensure_ascii=False)
+
+    val_dataset.save_to_disk(os.path.join(splits_dir, "val_dataset"))
+    test_dataset.save_to_disk(os.path.join(splits_dir, "test_dataset"))
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":
     parser = HfArgumentParser((DROScriptArguments, DROConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
+    state = PartialState()
 
     # Resolve the value model checkpoint (defaults to same as policy)
     value_model_path = script_args.value_model_name_or_path or model_args.model_name_or_path
@@ -241,19 +309,43 @@ if __name__ == "__main__":
     )
     full_dataset = make_dro_dataset(raw_train, num_proc=training_args.dataset_num_proc)
 
-    eval_dataset = None
-    if training_args.eval_strategy != "no":
-        # Carve a fixed-size eval split before capping training samples so
-        # that win-rate evaluation has enough prompts regardless of max_samples.
-        split = full_dataset.train_test_split(test_size=512, seed=42)
-        train_dataset = split["train"]
-        eval_dataset = split["test"]
-    else:
-        train_dataset = full_dataset
+    # Split by prompt rather than by row so a prompt never appears in multiple
+    # splits. Validation is used for checkpoint selection; test is held out for
+    # the final offline comparison only.
+    train_dataset, val_dataset, test_dataset, split_manifests = split_dataset_by_prompt(
+        full_dataset,
+        val_size=script_args.val_size,
+        test_size=script_args.test_size,
+        seed=script_args.split_seed,
+    )
 
-    # Apply training-sample cap after the eval split so the eval pool stays large.
+    # Apply training-sample cap after the split so the test pool stays intact.
     if script_args.max_samples is not None:
         train_dataset = train_dataset.select(range(min(script_args.max_samples, len(train_dataset))))
+
+    # Expose only the validation set to the Trainer. The test split stays fully
+    # untouched for later offline evaluation.
+    eval_dataset = val_dataset if training_args.eval_strategy != "no" else None
+
+    if state.is_main_process:
+        split_metadata = {
+            "dataset_name": script_args.dataset_name or "openbmb/UltraFeedback",
+            "dataset_config": script_args.dataset_config,
+            "dataset_train_split": script_args.dataset_train_split,
+            "split_seed": script_args.split_seed,
+            "val_size": script_args.val_size,
+            "test_size": script_args.test_size,
+            "full_num_rows": len(full_dataset),
+            "train_num_rows": len(train_dataset),
+            "val_num_rows": len(val_dataset),
+            "test_num_rows": len(test_dataset),
+            "train_num_prompts": len(split_manifests["train_prompts"]),
+            "val_num_prompts": len(split_manifests["val_prompts"]),
+            "test_num_prompts": len(split_manifests["test_prompts"]),
+            "max_samples": script_args.max_samples,
+        }
+        save_split_artifacts(training_args.output_dir, split_manifests, split_metadata, val_dataset, test_dataset)
+    state.wait_for_everyone()
 
     # ── Train ─────────────────────────────────────────────────────────────────
     trainer = DROTrainer(

@@ -10,8 +10,8 @@ if ! command -v runpodctl >/dev/null 2>&1; then
 fi
 
 POD_NAME="${POD_NAME:-mtpi-$(date +%Y%m%d-%H%M%S)}"
-POD_PROFILE="${POD_PROFILE:-h100-nvl-community}" # h100-sxm-secure | h100-nvl-community | a100-community | md | lg | xl
-GPU_COUNT="${GPU_COUNT:-2}"
+POD_PROFILE="${POD_PROFILE:-h100-sxm-secure}" # h100-sxm-secure | h100-nvl-community | a100-community | md | lg | xl
+GPU_COUNT="${GPU_COUNT:-1}"
 IMAGE_NAME="${IMAGE_NAME:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}"
 CONTAINER_DISK_SIZE="${CONTAINER_DISK_SIZE:-100}"
 VOLUME_SIZE="${VOLUME_SIZE:-0}"
@@ -33,13 +33,13 @@ fi
 if [[ -z "$GPU_ID" ]]; then
   case "$POD_PROFILE" in
     h100-sxm-secure)
-      GPU_ID="NVIDIA H100 SXM"
+      GPU_ID="NVIDIA H100 80GB HBM3"
       ;;
     h100-nvl-community)
       GPU_ID="NVIDIA H100 NVL"
       ;;
     a100-community)
-      GPU_ID="NVIDIA A100 SXM"
+      GPU_ID="NVIDIA A100-SXM4-80GB"
       ;;
     md)
       GPU_ID="NVIDIA L40S"
@@ -48,7 +48,7 @@ if [[ -z "$GPU_ID" ]]; then
       GPU_ID="NVIDIA A100 80GB PCIe"
       ;;
     xl)
-      GPU_ID="NVIDIA H100 SXM"
+      GPU_ID="NVIDIA H100 80GB HBM3"
       ;;
     *)
       echo "Unsupported POD_PROFILE='$POD_PROFILE'. Use: h100-sxm-secure | h100-nvl-community | a100-community | md | lg | xl"
